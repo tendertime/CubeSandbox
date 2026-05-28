@@ -8,6 +8,9 @@ use crate::coredump::{
 };
 use crate::migration::{memory_blob_to_path, url_to_path};
 use crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon;
+use crate::soft_dirty::{
+    clear_soft_dirty, filter_memory_ranges_by_anon_and_soft_dirty, probe_soft_dirty_support,
+};
 #[cfg(target_arch = "x86_64")]
 use crate::vm_config::SgxEpcConfig;
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
@@ -37,6 +40,7 @@ use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use tracer::trace_scoped;
 use virtio_devices::BlocksState;
@@ -290,6 +294,11 @@ pub struct MemoryManager {
     sgx_epc_region: Option<SgxEpcRegion>,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    /// Whether the soft-dirty tracker is currently armed (i.e. the previous
+    /// snapshot cycle ended with a successful `clear_soft_dirty()`, so the
+    /// pagemap bit-55 set this cycle reflects only writes that happened
+    /// since then).
+    soft_dirty_armed: AtomicBool,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -1264,6 +1273,7 @@ impl MemoryManager {
             sgx_epc_region: None,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            soft_dirty_armed: AtomicBool::new(false),
             memory_zones,
             guest_ram_mappings: Vec::new(),
             acpi_address,
@@ -2362,6 +2372,169 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// Save a soft-dirty incremental snapshot.
+    ///
+    /// This method writes a delta snapshot containing only the pages that
+    /// must change in the destination snapshot file. We compute that set as
+    /// the **intersection** of:
+    ///   * pagemap_anon (Copy-on-Written pages — only these can ever differ
+    ///     from the base snapshot file the guest was restored from), and
+    ///   * `/proc/self/pagemap` bit 55 (pages written since the previous
+    ///     `clear_soft_dirty()`).
+    ///
+    /// To remain compatible with the rest of the VMM (snapshot consumers
+    /// expect a self-contained, full-size memory image at the destination),
+    /// the resulting file is **not** a raw delta. We prepare a base image
+    /// at the destination and then overwrite only the filtered pages on
+    /// top.
+    ///
+    /// Lazy probe / arm:
+    /// Soft-dirty tracking is **not** probed nor armed at boot or restore
+    /// time anymore — `clear_refs(4)` walks every PTE under mmap_lock and
+    /// is the dominant pause-time cost on multi-GiB guests. Instead, the
+    /// very first call to this method:
+    ///   1. Tries `probe_soft_dirty_support()` (which itself performs the
+    ///      initial `clear_soft_dirty()` and arms tracking on success).
+    ///   2. Writes a snapshot using the pagemap_anon set (every CoW page),
+    ///      because there is no prior soft-dirty window to take an
+    ///      intersection against.
+    ///   3. Sets `soft_dirty_armed = true` only on probe success.
+    ///
+    /// Subsequent calls (with `soft_dirty_armed == true`) take the
+    /// anon ∩ soft-dirty intersection, write only the changed CoW pages,
+    /// and re-arm via `clear_soft_dirty()` for the next cycle.
+    ///
+    /// Degradation: if `probe_soft_dirty_support()` returns false (kernel
+    /// without `CONFIG_MEM_SOFT_DIRTY=y`), or any `clear_soft_dirty()`
+    /// call fails at runtime, this method silently falls back to the
+    /// pagemap_anon path and leaves `soft_dirty_armed` at false so the
+    /// next cycle retries. The fallback is logged but not surfaced as
+    /// an error to the caller.
+    fn send_soft_dirty_memory(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        // First-time path (or any time we are not currently armed): we
+        // cannot trust the soft-dirty bitmap because there is no prior
+        // `clear_soft_dirty()` to anchor the window, so write the full
+        // anon-page set. Then try to arm tracking for the next cycle.
+        if !self.soft_dirty_armed.load(Ordering::Acquire) {
+            info!(
+                "Soft-dirty: tracker not yet armed, writing full anon-page snapshot \
+                 and attempting to arm soft-dirty for the next cycle"
+            );
+
+            // Write a full anon-page (pagemap_anon) snapshot. This already
+            // matches what `send_pagemap_anon_memory` does and it produces
+            // a self-contained snapshot file.
+            self.send_pagemap_anon_memory(destination_url, memory_vol_url)?;
+
+            // Probe + arm. `probe_soft_dirty_support()` writes "4" to
+            // /proc/self/clear_refs, which both detects kernel support
+            // (returns false on EINVAL when CONFIG_MEM_SOFT_DIRTY=n) and,
+            // on success, clears every PTE's bit 55 — which is exactly
+            // the "arm" operation for the next snapshot window.
+            if probe_soft_dirty_support() {
+                self.soft_dirty_armed.store(true, Ordering::Release);
+                info!("Soft-dirty: tracker armed for next snapshot cycle");
+            } else {
+                debug!(
+                    "Soft-dirty: kernel does not support CONFIG_MEM_SOFT_DIRTY, \
+                     subsequent snapshots will keep using the anon-page path"
+                );
+            }
+
+            return Ok(());
+        }
+
+        // Steady-state path: the tracker has been armed by a previous
+        // call, so pagemap bit 55 reflects only writes that happened in
+        // this window. Filter pages by anon ∩ soft-dirty to get the
+        // minimal set that has actually changed since the last snapshot.
+        let memory_file_target =
+            MemorySnapshotFile::from_snapshot_url(destination_url, memory_vol_url.as_deref())?;
+
+        let guest_memory = self.guest_memory.memory();
+        let (filtered_ranges, stats) = filter_memory_ranges_by_anon_and_soft_dirty(
+            &guest_memory,
+            &self.snapshot_memory_ranges,
+        )
+        .map_err(|e| {
+            MigratableError::MigrateSend(anyhow!(
+                "Failed to filter memory with anon ∩ soft-dirty: {}",
+                e
+            ))
+        })?;
+
+        info!(
+            "Soft-dirty snapshot (anon ∩ soft-dirty): total={} bytes ({} pages), \
+             dirty={} bytes ({} pages), savings={:.1}%",
+            stats.total_bytes,
+            stats.total_pages,
+            stats.saved_bytes,
+            stats.dirty_pages,
+            stats.savings_percentage()
+        );
+
+        // Prepare the destination file. The previous snapshot already
+        // contains every still-clean page; we just overlay the changed
+        // ones in place. The base file is mandatory here: if it doesn't
+        // exist, a soft-dirty (delta) snapshot is meaningless because
+        // there is no full image to overlay onto. Refuse the request and
+        // let the caller take a Full snapshot first.
+        if !memory_file_target.path().exists() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Base snapshot file not found at {:?}, soft-dirty snapshot requires \
+                 an existing base file; take a full snapshot first",
+                memory_file_target.path()
+            )));
+        }
+        let memory_file = memory_file_target.open_read_write()?;
+
+        // Build a GPA-to-file-offset mapping for calculating offsets.
+        let mut gpa_to_file_offset: Vec<(u64, u64, u64)> = Vec::new();
+        let mut offset = 0_u64;
+        for range in self.snapshot_memory_ranges.regions() {
+            gpa_to_file_offset.push((range.gpa, range.length, offset));
+            offset += range.length;
+        }
+
+        // Overlay only the filtered (anon ∩ soft-dirty) pages.
+        for range in filtered_ranges.regions() {
+            let file_off =
+                Self::calculate_file_offset_for_gpa(range.gpa, range.length, &gpa_to_file_offset)?;
+            self.save_range_to_file(&memory_file, range, file_off)?;
+        }
+
+        memory_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        info!(
+            "Soft-dirty snapshot saved: {} dirty bytes written to {:?}",
+            stats.saved_bytes,
+            memory_file_target.path()
+        );
+
+        // Re-arm tracking for the next cycle.
+        if let Err(e) = clear_soft_dirty() {
+            warn!(
+                "Soft-dirty: clear_soft_dirty() failed after writing delta ({}), \
+                 disarming; the next snapshot will fall back to the full \
+                 anon-page path and try to re-arm",
+                e
+            );
+            self.soft_dirty_armed.store(false, Ordering::Release);
+        }
+
+        Ok(())
+    }
+
     /// Calculate the file offset for a given GPA within the snapshot file.
     ///
     /// The snapshot file stores memory regions sequentially. This method finds
@@ -2868,6 +3041,9 @@ impl Transportable for MemoryManager {
         match config.snapshot_type {
             SnapshotType::Incremental => {
                 self.send_pagemap_anon_memory(destination_url, &config.memory_vol_url)?;
+            }
+            SnapshotType::SoftDirty => {
+                self.send_soft_dirty_memory(destination_url, &config.memory_vol_url)?;
             }
             SnapshotType::Full => {
                 let memory_file = memory_file_target.open_for_fresh_write()?;

@@ -84,6 +84,7 @@ mod pci_segment;
 pub mod seccomp_filters;
 mod serial_manager;
 mod sigwinch_listener;
+pub mod soft_dirty;
 pub mod vm;
 pub mod vm_config;
 
