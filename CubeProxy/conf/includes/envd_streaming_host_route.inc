@@ -1,4 +1,8 @@
 proxy_buffering off;
+# Prevent nginx gzip-compressing Connect stream responses.
+# iter_raw() does not decompress Content-Encoding — gzip
+# magic bytes misread as 2.17 GiB Connect frame header.
+gzip off;
 # Streaming envd errors must pass through verbatim; intercepting them here
 # would replace protocol-native error frames with nginx error pages and break
 # client-side parsing.
