@@ -90,13 +90,10 @@ struct TerminalSessionRuntime {
 }
 
 impl TerminalService {
-    pub fn new(sandbox_service: SandboxService) -> Self {
+    pub fn new(sandbox_service: SandboxService, http_client: Client) -> Self {
         Self {
             sandbox_service,
-            http_client: Client::builder()
-                .connect_timeout(Duration::from_secs(3))
-                .build()
-                .expect("failed to build HTTP client"),
+            http_client,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -416,23 +413,23 @@ impl TerminalService {
         sandbox_id: &str,
         session_id: &str,
         text: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), PtyError> {
         if let Some(message) = Self::parse_client_message(text) {
             match message {
                 TerminalClientMessage::Resize { rows, cols } => {
                     let rows = rows.unwrap_or(24).clamp(1, 512) as u32;
                     let cols = cols.unwrap_or(80).clamp(1, 512) as u32;
                     info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize");
-                    if let Err(e) = pty_handle.resize(rows, cols).await {
-                        if e.contains("PTY process did not start in time")
-                            || e.contains("PTY process has not started yet")
-                        {
-                            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize deferred until PTY is ready");
-                        } else {
+                    match pty_handle.resize(rows, cols).await {
+                        Err(PtyError::NotStarted) => {
+                            warn!(sandbox_id = %sandbox_id, session_id = %session_id, "terminal resize deferred until PTY is ready");
+                        }
+                        Err(e) => {
                             warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize failed; keeping session alive");
                         }
-                    } else {
-                        info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize applied");
+                        Ok(()) => {
+                            info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize applied");
+                        }
                     }
                     return Ok(());
                 }
@@ -444,11 +441,8 @@ impl TerminalService {
         info!(sandbox_id = %sandbox_id, session_id = %session_id, input_len = text.len(), "terminal input");
         match pty_handle.send_stdin(text).await {
             Ok(()) => Ok(()),
-            Err(e)
-                if e.contains("PTY process did not start in time")
-                    || e.contains("PTY process has not started yet") =>
-            {
-                warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal input deferred until PTY is ready");
+            Err(PtyError::NotStarted) => {
+                warn!(sandbox_id = %sandbox_id, session_id = %session_id, "terminal input deferred until PTY is ready");
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 pty_handle.send_stdin(text).await
             }
@@ -461,15 +455,12 @@ impl TerminalService {
         sandbox_id: &str,
         session_id: &str,
         data: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), PtyError> {
         info!(sandbox_id = %sandbox_id, session_id = %session_id, input_len = data.len(), "terminal binary input");
         match pty_handle.send_stdin(&String::from_utf8_lossy(data)).await {
             Ok(()) => Ok(()),
-            Err(e)
-                if e.contains("PTY process did not start in time")
-                    || e.contains("PTY process has not started yet") =>
-            {
-                warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal binary input deferred until PTY is ready");
+            Err(PtyError::NotStarted) => {
+                warn!(sandbox_id = %sandbox_id, session_id = %session_id, "terminal binary input deferred until PTY is ready");
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 pty_handle.send_stdin(&String::from_utf8_lossy(data)).await
             }
@@ -487,7 +478,6 @@ impl TerminalService {
     async fn run_pty_session(
         mut socket: ws::WebSocket,
         mut send_rx: futures::channel::mpsc::Receiver<Message>,
-        _send_tx_keepalive: Arc<Mutex<futures::channel::mpsc::Sender<Message>>>,
         pty_handle: PtyHandle,
         runtime: TerminalSessionRuntime,
     ) {
@@ -495,6 +485,7 @@ impl TerminalService {
         let start = Instant::now();
         let mut last_activity = Instant::now();
         let mut hold_interval = tokio::time::interval(TERMINAL_KEEPALIVE_INTERVAL);
+        let mut output_stream_open = true;
 
         let _ = socket
             .send(Self::server_event_message(&TerminalServerEvent::Ready {
@@ -579,11 +570,14 @@ impl TerminalService {
                         None => break,
                     }
                 }
-                msg = send_rx.next() => {
-                    if let Some(msg) = msg {
-                        if socket.send(msg).await.is_err() {
-                            break;
+                msg = send_rx.next(), if output_stream_open => {
+                    match msg {
+                        Some(msg) => {
+                            if socket.send(msg).await.is_err() {
+                                break;
+                            }
                         }
+                        None => output_stream_open = false,
                     }
                 }
             }
@@ -727,20 +721,14 @@ impl TerminalService {
                     &access_token,
                     envd_auth.as_deref(),
                     run_runtime.context.container_id.as_deref(),
-                    send_tx.clone(),
+                    send_tx,
                     run_runtime.context.sandbox_id.clone(),
                 )
                 .await
                 {
                     Ok(pty_handle) => {
-                        Self::run_pty_session(
-                            socket,
-                            send_rx,
-                            send_tx.clone(),
-                            pty_handle,
-                            run_runtime.clone(),
-                        )
-                        .await;
+                        Self::run_pty_session(socket, send_rx, pty_handle, run_runtime.clone())
+                            .await;
                     }
                     Err(e) => {
                         warn!(sandbox_id = %run_runtime.context.sandbox_id, error = %e, "envd PTY connection failed");
@@ -973,6 +961,14 @@ struct PtyHandle {
     pid: Arc<AtomicU32>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PtyError {
+    #[error("PTY process has not started")]
+    NotStarted,
+    #[error("{0}")]
+    Operation(String),
+}
+
 impl PtyHandle {
     fn new(
         http_client: Client,
@@ -995,7 +991,7 @@ impl PtyHandle {
         }
     }
 
-    async fn send_stdin(&self, data: &str) -> Result<(), String> {
+    async fn send_stdin(&self, data: &str) -> Result<(), PtyError> {
         let pid = self.wait_for_pid(TERMINAL_PTY_STARTUP_WAIT).await?;
         let payload = serde_json::json!({
             "process": {"pid": pid},
@@ -1009,18 +1005,22 @@ impl PtyHandle {
             .post(&self.send_input_url)
             .headers(headers)
             .json(&payload)
+            .timeout(Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| format!("SendInput failed: {}", e))?;
+            .map_err(|e| PtyError::Operation(format!("SendInput failed: {}", e)))?;
 
         if !resp.status().is_success() {
-            return Err(format!("SendInput error: {}", resp.status()));
+            return Err(PtyError::Operation(format!(
+                "SendInput error: {}",
+                resp.status()
+            )));
         }
 
         Ok(())
     }
 
-    async fn resize(&self, rows: u32, cols: u32) -> Result<(), String> {
+    async fn resize(&self, rows: u32, cols: u32) -> Result<(), PtyError> {
         let pid = self.wait_for_pid(TERMINAL_PTY_STARTUP_WAIT).await?;
         tracing::info!(
             pid = pid,
@@ -1040,12 +1040,16 @@ impl PtyHandle {
             .post(&self.update_url)
             .headers(headers)
             .json(&payload)
+            .timeout(Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| format!("Resize failed: {}", e))?;
+            .map_err(|e| PtyError::Operation(format!("Resize failed: {}", e)))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Resize error: {}", resp.status()));
+            return Err(PtyError::Operation(format!(
+                "Resize error: {}",
+                resp.status()
+            )));
         }
 
         tracing::info!(
@@ -1057,7 +1061,7 @@ impl PtyHandle {
         Ok(())
     }
 
-    async fn wait_for_pid(&self, timeout: Duration) -> Result<u32, String> {
+    async fn wait_for_pid(&self, timeout: Duration) -> Result<u32, PtyError> {
         let start = Instant::now();
         loop {
             let pid = self.pid.load(Ordering::SeqCst);
@@ -1065,13 +1069,13 @@ impl PtyHandle {
                 return Ok(pid);
             }
             if start.elapsed() >= timeout {
-                return Err("PTY process did not start in time".to_string());
+                return Err(PtyError::NotStarted);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
-    async fn kill(&self) -> Result<(), String> {
+    async fn kill(&self) -> Result<(), PtyError> {
         let Ok(pid) = self.pid() else {
             return Ok(());
         };
@@ -1087,20 +1091,24 @@ impl PtyHandle {
             .post(&self.send_signal_url)
             .headers(headers)
             .json(&payload)
+            .timeout(Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| format!("SendSignal failed: {}", e))?;
+            .map_err(|e| PtyError::Operation(format!("SendSignal failed: {}", e)))?;
 
         if !resp.status().is_success() {
-            return Err(format!("SendSignal error: {}", resp.status()));
+            return Err(PtyError::Operation(format!(
+                "SendSignal error: {}",
+                resp.status()
+            )));
         }
 
         Ok(())
     }
 
-    fn pid(&self) -> Result<u32, String> {
+    fn pid(&self) -> Result<u32, PtyError> {
         match self.pid.load(Ordering::SeqCst) {
-            0 => Err("PTY process has not started yet".to_string()),
+            0 => Err(PtyError::NotStarted),
             pid => Ok(pid),
         }
     }
@@ -1137,8 +1145,12 @@ enum TerminalServerEvent<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalService;
+    use super::{PtyError, PtyHandle, TerminalService};
     use crate::{error::AppError, models::SandboxContainer};
+    use std::{
+        sync::{atomic::AtomicU32, Arc},
+        time::Duration,
+    };
 
     #[test]
     fn parses_resize_control_message() {
@@ -1174,6 +1186,22 @@ mod tests {
         assert!(TerminalService::sandbox_id_is_safe("sb-123_abc"));
         assert!(!TerminalService::sandbox_id_is_safe("../sb-123"));
         assert!(!TerminalService::sandbox_id_is_safe("sb/123"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pid_returns_typed_not_started_error() {
+        let handle = PtyHandle::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1/process.Process/Start",
+            String::new(),
+            None,
+            Arc::new(AtomicU32::new(0)),
+        );
+
+        assert!(matches!(
+            handle.wait_for_pid(Duration::ZERO).await,
+            Err(PtyError::NotStarted)
+        ));
     }
 
     #[test]

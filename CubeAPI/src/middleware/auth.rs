@@ -147,33 +147,40 @@ pub async fn unified_auth(
     if callback_url.is_empty() {
         // Mode 2: simple key auth — if CUBE_API_KEY is configured, compare
         // the extracted credential against it locally.
-        if let Some(expected_key) = state.config.cube_api_key.as_deref() {
-            if !expected_key.is_empty() {
-                let credential = extract_credential(&request).ok_or_else(|| {
-                    AppError::Unauthorized(
-                        "Missing authentication: provide 'Authorization: Bearer <token>' or 'X-API-Key: <key>'"
-                            .to_string(),
-                    )
-                })?;
-                let provided = match &credential {
-                    AuthCredential::Bearer(t) => t.as_str(),
-                    AuthCredential::ApiKey(k) => k.as_str(),
-                };
-                if provided != expected_key {
-                    tracing::warn!(
-                        path = %request.uri().path(),
-                        method = %request.method(),
-                        "simple key auth: credential mismatch"
-                    );
-                    return Err(AppError::Unauthorized(
-                        "Invalid API key or token".to_string(),
-                    ));
-                }
-            }
-        } else if request.uri().path().ends_with("/terminal") {
+        let expected_key = state
+            .config
+            .cube_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+
+        if expected_key.is_none() && request.uri().path().ends_with("/terminal") {
             return Err(AppError::Unauthorized(
                 "Terminal authentication is not configured".to_string(),
             ));
+        }
+
+        if let Some(expected_key) = expected_key {
+            let credential = extract_credential(&request).ok_or_else(|| {
+                AppError::Unauthorized(
+                    "Missing authentication: provide 'Authorization: Bearer <token>' or 'X-API-Key: <key>'"
+                        .to_string(),
+                )
+            })?;
+            let provided = match &credential {
+                AuthCredential::Bearer(t) => t.as_str(),
+                AuthCredential::ApiKey(k) => k.as_str(),
+            };
+            if provided != expected_key {
+                tracing::warn!(
+                    path = %request.uri().path(),
+                    method = %request.method(),
+                    "simple key auth: credential mismatch"
+                );
+                return Err(AppError::Unauthorized(
+                    "Invalid API key or token".to_string(),
+                ));
+            }
         }
         // Mode 3: no auth (both unset) or simple-key match — pass through.
         request.extensions_mut().insert(identity);
@@ -454,9 +461,11 @@ mod tests {
     /// When no callback is configured, requests without credentials must pass through.
     #[tokio::test]
     async fn no_callback_configured_passthrough() {
-        let mut config = ServerConfig::default();
-        config.auth_callback_url = None;
-        config.cube_api_key = None;
+        let config = ServerConfig {
+            auth_callback_url: None,
+            cube_api_key: None,
+            ..ServerConfig::default()
+        };
         let state = AppState::new(config, arc(NoopLogger)).await;
         let router = Router::new()
             .route("/sandboxes/:id", any(|| async { "ok" }))
@@ -473,9 +482,34 @@ mod tests {
     /// Interactive terminal access must never fall back to anonymous access.
     #[tokio::test]
     async fn terminal_without_auth_configuration_is_rejected() {
-        let mut config = ServerConfig::default();
-        config.auth_callback_url = None;
-        config.cube_api_key = None;
+        let config = ServerConfig {
+            auth_callback_url: None,
+            cube_api_key: None,
+            ..ServerConfig::default()
+        };
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        let router = Router::new()
+            .route("/sandboxes/:id/terminal", any(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                unified_auth,
+            ))
+            .with_state(state);
+        let server = TestServer::new(router).unwrap();
+
+        server
+            .get("/sandboxes/xyz/terminal")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn terminal_with_blank_api_key_is_rejected() {
+        let config = ServerConfig {
+            auth_callback_url: None,
+            cube_api_key: Some("   ".to_string()),
+            ..ServerConfig::default()
+        };
         let state = AppState::new(config, arc(NoopLogger)).await;
         let router = Router::new()
             .route("/sandboxes/:id/terminal", any(|| async { "ok" }))
@@ -536,8 +570,10 @@ mod tests {
     // ── Simple key mode (CUBE_API_KEY) ───────────────────────────────────
 
     async fn build_test_server_with_api_key(api_key: &str) -> TestServer {
-        let mut config = ServerConfig::default();
-        config.cube_api_key = Some(api_key.to_string());
+        let config = ServerConfig {
+            cube_api_key: Some(api_key.to_string()),
+            ..ServerConfig::default()
+        };
         let state = AppState::new(config, arc(NoopLogger)).await;
         let router = Router::new()
             .route("/sandboxes/:id", any(|| async { "ok" }))

@@ -82,6 +82,14 @@ pub struct ServerConfig {
     /// Env var: CUBE_API_KEY
     #[serde(default)]
     pub cube_api_key: Option<String>,
+
+    /// Exact browser origins allowed to open Web Terminal connections.
+    ///
+    /// Values are read as a comma-separated list from
+    /// `CUBESANDBOX_ALLOWED_ORIGINS`. When empty, terminal Origin validation
+    /// falls back to matching the request Host header.
+    #[serde(default = "default_terminal_allowed_origins")]
+    pub terminal_allowed_origins: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -114,6 +122,20 @@ fn default_log_dir() -> String {
 }
 fn default_log_prefix() -> String {
     "cube-api".to_string()
+}
+fn default_terminal_allowed_origins() -> Vec<String> {
+    std::env::var("CUBESANDBOX_ALLOWED_ORIGINS")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 impl ServerConfig {
@@ -157,6 +179,7 @@ impl Default for ServerConfig {
             log_prefix: default_log_prefix(),
             auth_callback_url: None,
             cube_api_key: std::env::var("CUBE_API_KEY").ok().filter(|s| !s.is_empty()),
+            terminal_allowed_origins: default_terminal_allowed_origins(),
         }
     }
 }
@@ -167,8 +190,10 @@ mod tests {
 
     #[test]
     fn auth_callback_ignores_blank_values_and_trims_valid_urls() {
-        let mut config = ServerConfig::default();
-        config.cube_api_key = None;
+        let mut config = ServerConfig {
+            cube_api_key: None,
+            ..ServerConfig::default()
+        };
         assert!(!config.auth_enabled());
 
         config.auth_callback_url = Some("   ".to_string());

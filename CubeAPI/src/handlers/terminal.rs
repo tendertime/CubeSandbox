@@ -32,7 +32,7 @@ pub async fn terminal_ws(
         )
         .await;
 
-    validate_terminal_origin(&headers)?;
+    validate_terminal_origin(&headers, &state.config.terminal_allowed_origins)?;
 
     let state_clone = state.clone();
     let operator_id = identity
@@ -82,13 +82,29 @@ pub(crate) struct TerminalQuery {
     container: Option<String>,
 }
 
-fn validate_terminal_origin(headers: &HeaderMap) -> Result<(), AppError> {
+fn validate_terminal_origin(
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+) -> Result<(), AppError> {
     let origin = headers
         .get("origin")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Unauthorized("missing WebSocket Origin".to_string()))?;
+
+    if !allowed_origins.is_empty() {
+        if allowed_origins
+            .iter()
+            .any(|allowed| origins_are_equivalent(origin, allowed))
+        {
+            return Ok(());
+        }
+        return Err(AppError::Unauthorized(format!(
+            "WebSocket Origin {} is not allowed",
+            origin
+        )));
+    }
 
     let host = headers
         .get("host")
@@ -105,6 +121,34 @@ fn validate_terminal_origin(headers: &HeaderMap) -> Result<(), AppError> {
         "WebSocket Origin {} does not match Host {}",
         origin, host
     )))
+}
+
+fn origins_are_equivalent(left: &str, right: &str) -> bool {
+    matches!(
+        (strict_origin(left), strict_origin(right)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+fn strict_origin(origin: &str) -> Option<(String, String, u16)> {
+    let parsed = reqwest::Url::parse(origin).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return None;
+    }
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+    Some((
+        scheme,
+        parsed.host_str()?.to_ascii_lowercase(),
+        parsed.port_or_known_default()?,
+    ))
 }
 
 fn origin_matches_host(origin: &str, host: &str) -> bool {
@@ -164,7 +208,7 @@ fn parse_host_like(value: &str) -> Option<(String, Option<u16>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::origin_matches_host;
+    use super::{origin_matches_host, validate_terminal_origin};
     use crate::{
         config::ServerConfig,
         logging::{arc, noop::NoopLogger},
@@ -428,7 +472,8 @@ mod tests {
     async fn wait_for_len<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
         timeout(Duration::from_secs(5), async {
             loop {
-                if items.lock().await.len() >= expected {
+                let len = items.lock().await.len();
+                if len >= expected {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -457,6 +502,39 @@ mod tests {
             "https://example.com",
             "malicious.example"
         ));
+    }
+
+    #[test]
+    fn configured_origin_allowlist_takes_priority_over_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://console.example.com"),
+        );
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("untrusted-proxy-host.example"),
+        );
+
+        assert!(
+            validate_terminal_origin(&headers, &["https://console.example.com".to_string()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn configured_origin_allowlist_rejects_unlisted_origin_even_when_host_matches() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://other.example.com"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("other.example.com"));
+
+        assert!(
+            validate_terminal_origin(&headers, &["https://console.example.com".to_string()])
+                .is_err()
+        );
     }
 
     #[tokio::test]

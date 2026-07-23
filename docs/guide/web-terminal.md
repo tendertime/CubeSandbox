@@ -35,6 +35,16 @@ export CUBESANDBOX_TERMINAL_MAX_SESSIONS=64
 export CUBESANDBOX_TERMINAL_MAX_SESSIONS_PER_SANDBOX=8
 ```
 
+For production deployments, configure the exact WebUI origins that may open a
+terminal. Multiple origins are comma-separated:
+
+```bash
+export CUBESANDBOX_ALLOWED_ORIGINS="https://console.example.com,https://admin.example.com:8443"
+```
+
+When this variable is set, it takes priority over Host-based same-origin
+validation. Invalid or unlisted origins are rejected.
+
 ## Reverse Proxy
 
 The reverse proxy in front of WebUI/CubeAPI must allow WebSocket upgrades for `/sandboxes/`.
@@ -47,11 +57,14 @@ location /sandboxes/ {
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
+    # Use a trusted configured value, not the client-supplied Host header.
+    proxy_set_header Host console.example.com;
 }
 ```
 
-Use WSS when WebUI is served over HTTPS.
+Use WSS when WebUI is served over HTTPS. If `CUBESANDBOX_ALLOWED_ORIGINS` is not
+configured, Host matching is only a best-effort fallback. Edge proxies MUST
+replace external Host headers with a trusted value before forwarding requests.
 
 ## Usage
 

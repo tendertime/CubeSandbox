@@ -46,7 +46,7 @@ impl AppState {
             .expect("failed to build HTTP client");
 
         let cubemaster = CubeMasterClient::new(config.cubemaster_url.clone(), http_client.clone());
-        let services = AppServices::new(&config, cubemaster);
+        let services = AppServices::new(&config, cubemaster, http_client.clone());
 
         Self {
             rate_limiter,

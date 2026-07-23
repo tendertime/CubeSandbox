@@ -91,7 +91,11 @@ pub struct AppServices {
 }
 
 impl AppServices {
-    pub fn new(config: &ServerConfig, cubemaster: CubeMasterClient) -> Self {
+    pub fn new(
+        config: &ServerConfig,
+        cubemaster: CubeMasterClient,
+        http_client: reqwest::Client,
+    ) -> Self {
         let sandboxes = sandboxes::SandboxService::new(
             cubemaster.clone(),
             config.instance_type.clone(),
@@ -107,7 +111,7 @@ impl AppServices {
                 cubemaster.clone(),
                 config.instance_type.clone(),
             ),
-            terminal: terminal::TerminalService::new(sandboxes),
+            terminal: terminal::TerminalService::new(sandboxes, http_client),
             volumes: volumes::VolumeService::new(cubemaster),
         }
     }
