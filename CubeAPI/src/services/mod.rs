@@ -5,6 +5,7 @@
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;
+pub mod terminal;
 pub mod volumes;
 
 use crate::{
@@ -85,17 +86,19 @@ pub struct AppServices {
     pub sandboxes: sandboxes::SandboxService,
     pub snapshots: snapshots::SnapshotService,
     pub templates: templates::TemplateService,
+    pub terminal: terminal::TerminalService,
     pub volumes: volumes::VolumeService,
 }
 
 impl AppServices {
     pub fn new(config: &ServerConfig, cubemaster: CubeMasterClient) -> Self {
+        let sandboxes = sandboxes::SandboxService::new(
+            cubemaster.clone(),
+            config.instance_type.clone(),
+            config.sandbox_domain.clone(),
+        );
         Self {
-            sandboxes: sandboxes::SandboxService::new(
-                cubemaster.clone(),
-                config.instance_type.clone(),
-                config.sandbox_domain.clone(),
-            ),
+            sandboxes: sandboxes.clone(),
             snapshots: snapshots::SnapshotService::new(
                 cubemaster.clone(),
                 config.instance_type.clone(),
@@ -104,6 +107,7 @@ impl AppServices {
                 cubemaster.clone(),
                 config.instance_type.clone(),
             ),
+            terminal: terminal::TerminalService::new(sandboxes),
             volumes: volumes::VolumeService::new(cubemaster),
         }
     }

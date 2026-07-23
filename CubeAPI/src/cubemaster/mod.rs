@@ -1176,6 +1176,7 @@ pub struct SandboxDetail {
     pub cpu_count: i32,
     pub memory_mb: i32,
     pub disk_size_mb: i32,
+    pub containers: Vec<crate::models::SandboxContainer>,
     pub annotations: HashMap<String, String>,
     pub labels: HashMap<String, String>,
 }
@@ -1324,14 +1325,18 @@ impl GetSandboxResponse {
     /// Take the first item from `data` and convert to SandboxDetail. Returns None if data is empty.
     pub fn into_first_sandbox(self, instance_type: &str) -> Option<SandboxDetail> {
         let item = self.data.into_iter().next()?;
-        let primary_container = item
-            .containers
-            .iter()
-            .find(|c| c.kind == "sandbox" || c.container_id == item.sandbox_id)
-            .or_else(|| item.containers.first());
-        let (cpu_count, memory_mb) = primary_container
-            .map(|c| (parse_cpu_millicores(&c.cpu), parse_mem_mb(&c.mem)))
-            .unwrap_or((0, 0));
+        let containers_raw = item.containers;
+        let (cpu_count, memory_mb, started_at) = {
+            let primary_container = containers_raw
+                .iter()
+                .find(|c| c.kind == "sandbox" || c.container_id == item.sandbox_id)
+                .or_else(|| containers_raw.first());
+            let (cpu_count, memory_mb) = primary_container
+                .map(|c| (parse_cpu_millicores(&c.cpu), parse_mem_mb(&c.mem)))
+                .unwrap_or((0, 0));
+            let started_at = primary_container.and_then(|c| datetime_from_unix_nanos(c.create_at));
+            (cpu_count, memory_mb, started_at)
+        };
         let status = match item.status {
             0 => SandboxStatus::Unknown, // CONTAINER_CREATED
             1 => SandboxStatus::Running, // CONTAINER_RUNNING
@@ -1343,17 +1348,47 @@ impl GetSandboxResponse {
         };
         let template_id = extract_template_id(&item.template_id, &item.annotations, &item.labels);
         let sid = item.sandbox_id;
+        let containers = if containers_raw.is_empty() {
+            vec![crate::models::SandboxContainer {
+                name: "sandbox".to_string(),
+                container_id: sid.clone(),
+                status: container_state_from_status(item.status),
+                image: String::new(),
+                kind: Some("sandbox".to_string()),
+                primary: true,
+            }]
+        } else {
+            containers_raw
+                .into_iter()
+                .map(|container| {
+                    let primary = container.kind == "sandbox" || container.container_id == sid;
+                    crate::models::SandboxContainer {
+                        name: container.name,
+                        container_id: container.container_id,
+                        status: container_state_from_status(container.status),
+                        image: container.image,
+                        kind: if container.kind.is_empty() {
+                            None
+                        } else {
+                            Some(container.kind)
+                        },
+                        primary,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
         Some(SandboxDetail {
             sandbox_id: sid.clone(),
             host_id: item.host_id,
             instance_type: instance_type.to_string(),
             status,
             template_id,
-            started_at: primary_container.and_then(|c| datetime_from_unix_nanos(c.create_at)),
+            started_at,
             end_at: item.end_at,
             cpu_count,
             memory_mb,
             disk_size_mb: 0,
+            containers,
             annotations: item.annotations,
             labels: item.labels,
         })
@@ -1364,6 +1399,19 @@ impl Default for SandboxStatus {
     fn default() -> Self {
         SandboxStatus::Unknown
     }
+}
+
+fn container_state_from_status(status: i32) -> String {
+    match status {
+        0 => "created",
+        1 => "running",
+        2 => "exited",
+        3 => "unknown",
+        4 => "pausing",
+        5 => "paused",
+        _ => "unknown",
+    }
+    .to_string()
 }
 
 // ─── Update sandbox (pause / resume) ───────────────────────────────────────
@@ -2494,6 +2542,35 @@ mod tests {
                 .timestamp_nanos_opt(),
             Some(1713953785140309977)
         );
+    }
+
+    #[test]
+    fn get_sandbox_falls_back_to_primary_container_when_list_is_empty() {
+        let payload = serde_json::json!({
+            "requestID": "req-2",
+            "ret": { "ret_code": 0, "ret_msg": "ok" },
+            "data": [{
+                "sandbox_id": "sb-9",
+                "host_id": "host-9",
+                "status": 1,
+                "template_id": "tpl-9",
+                "containers": []
+            }]
+        });
+
+        let response: GetSandboxResponse =
+            serde_json::from_value(payload).expect("response should deserialize");
+        let detail = response
+            .into_first_sandbox("cubebox")
+            .expect("detail should exist");
+
+        assert_eq!(detail.containers.len(), 1);
+        let container = &detail.containers[0];
+        assert_eq!(container.container_id, "sb-9");
+        assert_eq!(container.name, "sandbox");
+        assert!(container.primary);
+        assert_eq!(container.kind.as_deref(), Some("sandbox"));
+        assert_eq!(container.status, "running");
     }
 }
 

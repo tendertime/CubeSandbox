@@ -22,6 +22,7 @@ use crate::{
         SandboxVolumeMount,
     },
 };
+use chrono::{DateTime, Utc};
 
 const RET_CODE_OK: i32 = 0;
 const RET_CODE_HTTP_OK: i32 = 200;
@@ -34,6 +35,13 @@ const ENV_VAR_NAME_MAX_LEN: usize = 256;
 const ENV_VAR_VALUE_MAX_LEN: usize = 4096;
 const MASK_REQUEST_HOST_MAX_LEN: usize = 512;
 const MASK_REQUEST_HOST_PORT_PLACEHOLDER: &str = "${PORT}";
+
+fn resolve_sandbox_end_at(
+    summary_end_at: Option<DateTime<Utc>>,
+    detail_end_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    summary_end_at.or(detail_end_at)
+}
 
 /// Environment variable names that may compromise sandbox isolation if injected
 /// at the runtime level (loader overrides, language runtime paths).
@@ -122,13 +130,20 @@ impl SandboxService {
             .and_then(|s| s.started_at.as_ref().cloned())
             .or(d.started_at)
             .unwrap_or_else(chrono::Utc::now);
-        // Leave end_at as None for never-timeout sandboxes (CubeMaster returns
-        // no end instant) instead of collapsing it onto started_at, which
-        // would read as "already expired".
-        let end_at = summary
-            .as_ref()
-            .and_then(|s| s.end_at.as_ref().cloned())
-            .or(d.end_at);
+        let end_at = resolve_sandbox_end_at(
+            summary.as_ref().and_then(|s| s.end_at.as_ref().cloned()),
+            d.end_at,
+        );
+        let cpu_count = if d.cpu_count > 0 {
+            d.cpu_count
+        } else {
+            summary.as_ref().map(|s| s.cpu_count).unwrap_or(d.cpu_count)
+        };
+        let memory_mb = if d.memory_mb > 0 {
+            d.memory_mb
+        } else {
+            summary.as_ref().map(|s| s.memory_mb).unwrap_or(d.memory_mb)
+        };
 
         let envd_version = envd_version_from_annotations(&d.annotations);
         Ok(SandboxDetail {
@@ -141,9 +156,14 @@ impl SandboxService {
             envd_version,
             envd_access_token: None,
             domain: Some(self.sandbox_domain.clone()),
-            cpu_count: d.cpu_count,
-            memory_mb: d.memory_mb,
+            cpu_count,
+            memory_mb,
             disk_size_mb: Some(d.disk_size_mb),
+            containers: if d.containers.is_empty() {
+                None
+            } else {
+                Some(d.containers)
+            },
             metadata: optional_metadata(d.labels),
             state: sandbox_state_from_status(d.status),
             volume_mounts: None,
@@ -1348,6 +1368,11 @@ mod tests {
         assert_eq!(listed.cpu_count, 2);
         assert_eq!(listed.memory_mb, 2048);
         assert_eq!(listed.template_id, "tpl-1");
+    }
+
+    #[test]
+    fn sandbox_detail_end_at_stays_none_when_unset() {
+        assert!(super::resolve_sandbox_end_at(None, None).is_none());
     }
 
     #[test]

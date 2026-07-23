@@ -429,10 +429,19 @@ export interface components {
             templateID: string;
             trafficAccessToken?: string | null;
         };
+        SandboxContainer: {
+            containerID: string;
+            image: string;
+            kind?: string | null;
+            name: string;
+            primary: boolean;
+            status: string;
+        };
         /** @description Detailed sandbox info returned by GET /sandboxes/{sandboxID}. */
         SandboxDetail: {
             alias?: string | null;
             clientID: string;
+            containers?: components["schemas"]["SandboxContainer"][] | null;
             /** K8s-style millicores string, e.g. "2000m" (= 2 vCPU), "128m" (= 0.128 vCPU). */
             cpuCount: string;
             /** Format: int32 */

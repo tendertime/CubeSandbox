@@ -9,6 +9,12 @@ use axum::{
     response::Response,
 };
 
+/// Verified request identity injected by the auth middleware.
+#[derive(Debug, Clone)]
+pub struct RequestIdentity {
+    pub operator_id: String,
+}
+
 /// Auth credential extracted from the request headers.
 #[derive(Debug)]
 enum AuthCredential {
@@ -47,6 +53,26 @@ fn extract_credential(request: &Request) -> Option<AuthCredential> {
     None
 }
 
+fn extract_request_identity(request: &Request) -> RequestIdentity {
+    let headers = request.headers();
+    for key in ["x-operator-id", "x-user-id", "x-authenticated-user"] {
+        if let Some(value) = headers.get(key) {
+            if let Ok(value) = value.to_str() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return RequestIdentity {
+                        operator_id: value.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    RequestIdentity {
+        operator_id: "unknown".to_string(),
+    }
+}
+
 /// Unified auth middleware.
 ///
 /// Behavior (priority order):
@@ -78,9 +104,11 @@ fn extract_credential(request: &Request) -> Option<AuthCredential> {
 /// callback to enforce fine-grained (path + method) authorization.
 pub async fn unified_auth(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
+    let identity = extract_request_identity(&request);
+
     // Mode 1: callback auth — if a callback URL is configured, forward the
     // credential and let the external system decide.
     let callback_url = match state.config.auth_callback_url.as_deref() {
@@ -116,6 +144,7 @@ pub async fn unified_auth(
             }
         }
         // Mode 3: no auth (both unset) or simple-key match — pass through.
+        request.extensions_mut().insert(identity);
         return Ok(next.run(request).await);
     }
 
@@ -166,6 +195,7 @@ pub async fn unified_auth(
             auth_type = auth_type,
             "auth callback approved"
         );
+        request.extensions_mut().insert(identity);
         Ok(next.run(request).await)
     } else {
         tracing::warn!(

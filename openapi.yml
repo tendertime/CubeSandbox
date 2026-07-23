@@ -1,8 +1,3 @@
----
-# Copyright (c) 2026 Tencent Inc.
-# SPDX-License-Identifier: Apache-2.0
-#
-
 openapi: 3.1.0
 info:
   title: CubeAPI
@@ -1265,6 +1260,29 @@ components:
           type:
           - string
           - 'null'
+    SandboxContainer:
+      type: object
+      required:
+      - name
+      - containerID
+      - status
+      - image
+      - primary
+      properties:
+        containerID:
+          type: string
+        image:
+          type: string
+        kind:
+          type:
+          - string
+          - 'null'
+        name:
+          type: string
+        primary:
+          type: boolean
+        status:
+          type: string
     SandboxDetail:
       type: object
       description: Detailed sandbox info returned by GET /sandboxes/{sandboxID}.
@@ -1285,6 +1303,12 @@ components:
           - 'null'
         clientID:
           type: string
+        containers:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/SandboxContainer'
         cpuCount:
           type: integer
           format: int32

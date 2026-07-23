@@ -25,9 +25,10 @@ export function useGlobalHotkeys() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName;
-      const isInput =
-        tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement).isContentEditable;
+      const target = e.target as HTMLElement;
+      const tag = target.tagName;
+      const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable;
+      const isTerminal = target.closest('.xterm') !== null;
 
       // ── ⌘K / Ctrl+K → Command Palette ──────────────────────────────
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -37,13 +38,13 @@ export function useGlobalHotkeys() {
       }
 
       // ── Escape → Close Palette ──────────────────────────────────────
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !isTerminal) {
         openPalette(false);
         return;
       }
 
-      // ── Skip remaining shortcuts when focus is in an input ──────────
-      if (isInput || e.metaKey || e.ctrlKey || e.altKey) return;
+      // ── Skip remaining shortcuts when focus is in an input or terminal ──────────
+      if (isInput || isTerminal || e.metaKey || e.ctrlKey || e.altKey) return;
 
       // ── R → Refetch all active queries ──────────────────────────────
       if (e.key.toLowerCase() === 'r') {

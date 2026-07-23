@@ -255,8 +255,41 @@ export function listSandboxes(filters: { state?: string | null; metadata?: strin
 export function getSandboxDetail(sandboxID: string): SandboxDetailDto | undefined {
   const sandbox = sandboxes.find((item) => item.sandboxID === sandboxID);
   if (!sandbox) return undefined;
+  const containers =
+    sandbox.sandboxID === 'isb_9f2e4c7a1b0d83e6'
+      ? [
+          {
+            name: 'sandbox',
+            containerID: 'isb_9f2e4c7a1b0d83e6',
+            status: 'running',
+            image: 'registry.cube.dev/templates/python-3.11-ai:2024.11.02',
+            kind: 'sandbox',
+            primary: true,
+          },
+          {
+            name: 'worker',
+            containerID: 'worker-1',
+            status: 'running',
+            image: 'registry.cube.dev/templates/python-worker:1.0.0',
+            kind: 'workload',
+            primary: false,
+          },
+        ]
+      : sandbox.sandboxID === 'isb_7711bb32e8ad4c90'
+        ? [
+            {
+              name: 'sandbox',
+              containerID: 'isb_7711bb32e8ad4c90',
+              status: 'running',
+              image: 'registry.cube.dev/templates/nodejs-20-web:20.18.0',
+              kind: 'sandbox',
+              primary: true,
+            },
+          ]
+        : undefined;
   return {
     ...clone(sandbox),
+    ...(containers ? { containers } : {}),
     envdAccessToken: `eat_${sandbox.sandboxID.slice(-8)}`,
     domain: 'cube.local',
   };

@@ -312,10 +312,24 @@ pub struct SandboxDetail {
     #[serde(rename = "diskSizeMB", skip_serializing_if = "Option::is_none")]
     pub disk_size_mb: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<SandboxContainer>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SandboxMetadata>,
     pub state: SandboxState,
     #[serde(rename = "volumeMounts", skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct SandboxContainer {
+    pub name: String,
+    #[serde(rename = "containerID")]
+    pub container_id: String,
+    pub status: String,
+    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub primary: bool,
 }
 
 // ─── Sandbox — pause/resume/connect/snapshot ──────────────────────────────

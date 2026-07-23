@@ -31,9 +31,11 @@ function resolveAppVersion(): string {
   return pkg.version;
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   define: {
     __APP_VERSION__: JSON.stringify(resolveAppVersion()),
+    'process.env': '{}',
+    'process.env.NODE_ENV': JSON.stringify(mode),
   },
   plugins: [react()],
   resolve: {
@@ -51,13 +53,19 @@ export default defineConfig({
       },
       // CubeAPI (SDK/E2B endpoints) — proxy specific API paths to avoid
       // conflicting with vite's own static file serving.
-      '/sandboxes': 'http://127.0.0.1:3000',
+      '/sandboxes': {
+        target: 'http://127.0.0.1:3000',
+        ws: true,
+      },
       '/v2/sandboxes': 'http://127.0.0.1:3000',
       '/templates': 'http://127.0.0.1:3000',
       '/snapshots': 'http://127.0.0.1:3000',
       '/health': 'http://127.0.0.1:3000',
       // Legacy /cubeapi proxy for backward compat during transition
-      '/cubeapi': 'http://127.0.0.1:3000',
+      '/cubeapi': {
+        target: 'http://127.0.0.1:3000',
+        ws: true,
+      },
     },
   },
-});
+}));

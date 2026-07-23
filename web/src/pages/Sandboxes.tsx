@@ -11,11 +11,12 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Pause, Play, Trash2, Search, Plus } from 'lucide-react';
+import { Pause, Play, Trash2, Search, Plus, Terminal } from 'lucide-react';
 import { formatBytes, formatRelative, short } from '@/lib/utils';
 import { cn } from '@/lib/utils';
 import { formatSandboxActionError } from '@/lib/sandboxActionError';
 import { SandboxActionErrorBanner } from '@/components/SandboxActionErrorBanner';
+import { TerminalPanel } from '@/components/TerminalPanel';
 
 type StateFilter = 'all' | 'running' | 'paused';
 
@@ -212,61 +213,54 @@ function Row({
   busy: boolean;
 }) {
   const { t } = useTranslation('sandboxes');
+  const [showTerminal, setShowTerminal] = useState(false);
   const state = sb.state ?? 'running';
   const tone = state === 'paused' ? 'warn' : state === 'running' ? 'ok' : 'mute';
   return (
-    <div className="grid grid-cols-[120px_minmax(200px,1.2fr)_minmax(160px,1fr)_110px_120px_130px_120px_120px] gap-2 border-b border-border/60 px-4 py-3 text-sm transition hover:bg-muted/50">
-      <div>
-        <Badge tone={tone as any}>{state}</Badge>
-      </div>
-      <div className="flex flex-col">
-        <Link
-          to={`/sandboxes/${sb.sandboxID}`}
-          className="font-mono text-xs text-foreground hover:text-primary"
-        >
-          {short(sb.sandboxID)}
-        </Link>
-        {sb.alias && (
-          <span className="text-xs text-muted-foreground">{t('alias', { alias: sb.alias })}</span>
-        )}
-      </div>
-      <div className="truncate text-xs text-muted-foreground">{sb.templateID ?? '—'}</div>
-      <div className="text-xs text-muted-foreground text-num">{sb.cpuCount ?? '—'}</div>
-      <div className="text-xs text-muted-foreground text-num">{formatBytes(sb.memoryMB)}</div>
-      <div className="text-xs text-muted-foreground/80 text-num">{sb.clientID || '—'}</div>
-      <div className="text-xs text-muted-foreground">{formatRelative(sb.startedAt)}</div>
-      <div className="flex justify-end gap-1">
-        {state === 'paused' ? (
-          <Button
-            size="icon"
-            variant="ghost"
-            title={t('actions.resume')}
-            onClick={onResume}
-            disabled={busy}
+    <>
+      <div className="grid grid-cols-[120px_minmax(200px,1.2fr)_minmax(160px,1fr)_110px_120px_130px_120px_120px] gap-2 border-b border-border/60 px-4 py-3 text-sm transition hover:bg-muted/50">
+        <div>
+          <Badge tone={tone as any}>{state}</Badge>
+        </div>
+        <div className="flex flex-col">
+          <Link
+            to={`/sandboxes/${sb.sandboxID}`}
+            className="font-mono text-xs text-foreground hover:text-primary"
           >
-            <Play size={14} />
+            {short(sb.sandboxID)}
+          </Link>
+          {sb.alias && (
+            <span className="text-xs text-muted-foreground">{t('alias', { alias: sb.alias })}</span>
+          )}
+        </div>
+        <div className="truncate text-xs text-muted-foreground">{sb.templateID ?? '—'}</div>
+        <div className="text-xs text-muted-foreground text-num">{sb.cpuCount ?? '—'}</div>
+        <div className="text-xs text-muted-foreground text-num">{formatBytes(sb.memoryMB)}</div>
+        <div className="text-xs text-muted-foreground/80 text-num">{sb.clientID || '—'}</div>
+        <div className="text-xs text-muted-foreground">{formatRelative(sb.startedAt)}</div>
+        <div className="flex justify-end gap-1">
+          {state === 'running' && (
+            <Button size="icon" variant="ghost" title={t('actions.openTerminal')} onClick={() => setShowTerminal(true)} disabled={busy}>
+              <Terminal size={14} />
+            </Button>
+          )}
+          {state === 'paused' ? (
+            <Button size="icon" variant="ghost" title={t('actions.resume')} onClick={onResume} disabled={busy}>
+              <Play size={14} />
+            </Button>
+          ) : (
+            <Button size="icon" variant="ghost" title={t('actions.pause')} onClick={onPause} disabled={busy}>
+              <Pause size={14} />
+            </Button>
+          )}
+          <Button size="icon" variant="ghost" title={t('actions.kill')} onClick={onKill} disabled={busy}>
+            <Trash2 size={14} className="text-cube-err" />
           </Button>
-        ) : (
-          <Button
-            size="icon"
-            variant="ghost"
-            title={t('actions.pause')}
-            onClick={onPause}
-            disabled={busy}
-          >
-            <Pause size={14} />
-          </Button>
-        )}
-        <Button
-          size="icon"
-          variant="ghost"
-          title={t('actions.kill')}
-          onClick={onKill}
-          disabled={busy}
-        >
-          <Trash2 size={14} className="text-cube-err" />
-        </Button>
+        </div>
       </div>
-    </div>
+      {showTerminal && (
+        <TerminalPanel sandboxId={sb.sandboxID} onClose={() => setShowTerminal(false)} />
+      )}
+    </>
   );
 }

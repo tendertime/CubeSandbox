@@ -8,6 +8,9 @@ CubeOps/bin/
 /go.work
 /go.work.sum
 
+# Node.js dependencies
+**/node_modules/
+
 # IDE
 .idea/
 .vscode/
