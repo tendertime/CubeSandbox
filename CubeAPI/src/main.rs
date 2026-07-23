@@ -55,7 +55,7 @@ struct Cli {
 
     /// Auth callback URL for HTTP authentication.
     ///
-    /// When set, every API request (except GET /health) must carry either:
+    /// When set, protected API requests must carry either:
     ///   - "Authorization: Bearer <token>", or
     ///   - "X-API-Key: <key>"
     ///
@@ -65,7 +65,8 @@ struct Cli {
     /// The callback must return HTTP 200 to allow the request; any other
     /// status code causes the server to reject the request with 401.
     ///
-    /// When omitted, all requests are allowed without authentication.
+    /// When omitted, CUBE_API_KEY is used when configured. Without either
+    /// setting, ordinary APIs remain open and terminal WebSocket access is disabled.
     /// Overrides the AUTH_CALLBACK_URL environment variable.
     #[arg(long, value_name = "URL")]
     auth_callback_url: Option<String>,
@@ -179,8 +180,7 @@ fn main() -> anyhow::Result<()> {
         debug_mode = cli.debug,
         log_level = %cfg.log_level,
         bind = %cfg.bind,
-        auth_enabled = cfg.auth_callback_url.is_some()
-            || cfg.cube_api_key.is_some(),
+        auth_enabled = cfg.auth_enabled(),
         "cube-api starting"
     );
 

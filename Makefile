@@ -108,6 +108,7 @@ help:
 	@printf "  agent         Build cube-agent in Docker\n"
 	@printf "  cubeapi       Build CubeAPI (cube-api) in Docker\n"
 	@printf "  cube-api      Alias of cubeapi\n"
+	@printf "  cubeapi-dev-auth Start CubeAPI with the local mock auth callback\n"
 	@printf "  cubeops       Build CubeOps in Docker\n"
 	@printf "  cubeops-test  Run CubeOps unit tests in Docker\n"
 	@printf "  shim          Build containerd-shim-cube-rs and cube-runtime in Docker\n"
@@ -346,6 +347,10 @@ manual-release: all
 .PHONY: web-install
 web-install:
 	cd "$(WEB_DIR)" && npm install
+
+.PHONY: cubeapi-dev-auth
+cubeapi-dev-auth:
+	"$(ROOT_DIR)/scripts/run-cubeapi-dev-auth.sh"
 
 .PHONY: web-dev
 web-dev:

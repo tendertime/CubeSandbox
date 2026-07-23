@@ -32,16 +32,7 @@ const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_LONG_ROUTE_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub fn build_router(state: AppState) -> Router {
-    let auth_configured = state
-        .config
-        .auth_callback_url
-        .as_deref()
-        .is_some_and(|u| !u.is_empty())
-        || state
-            .config
-            .cube_api_key
-            .as_deref()
-            .is_some_and(|k| !k.is_empty());
+    let auth_configured = state.config.auth_enabled();
 
     let standard_router = apply_http_layers(
         Router::new().merge(build_e2b_router(&state, auth_configured)),
@@ -62,6 +53,7 @@ fn build_e2b_router(state: &AppState, auth_configured: bool) -> Router<AppState>
     Router::new()
         .route("/health", get(health::health))
         .merge(build_sandbox_routes(state, auth_configured))
+        .merge(build_terminal_routes(state))
         .merge(build_template_routes(state, auth_configured))
         .merge(build_volume_routes(state, auth_configured))
 }
@@ -109,10 +101,16 @@ fn build_sandbox_routes(state: &AppState, auth_configured: bool) -> Router<AppSt
             "/sandboxes/:sandboxID/connect",
             post(sandboxes::connect_sandbox),
         )
-        .route("/sandboxes/:sandboxID/terminal", get(terminal::terminal_ws))
         .route("/snapshots", get(snapshots::list_snapshots));
 
     with_auth_and_rate_limit(routes, state, auth_configured)
+}
+
+fn build_terminal_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/sandboxes/:sandboxID/terminal", get(terminal::terminal_ws))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(state.clone(), unified_auth))
 }
 
 /// Sandbox-rooted routes that must run on the long (240 s) budget.

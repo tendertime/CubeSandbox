@@ -6,7 +6,7 @@ use axum::{
     http::HeaderMap,
     response::IntoResponse,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     error::AppError,
@@ -38,6 +38,24 @@ pub async fn terminal_ws(
     let operator_id = identity
         .map(|Extension(identity)| identity.operator_id)
         .unwrap_or_else(|| "unknown".to_string());
+
+    if !state.config.auth_enabled() {
+        warn!(
+            sandbox_id = %sandbox_id,
+            "terminal authentication unavailable: no authentication mode is configured"
+        );
+        state
+            .logger
+            .log(
+                LogEvent::new(LogLevel::Warn, "terminal.auth_unavailable")
+                    .field("sandbox_id", &sandbox_id)
+                    .field("reason", "authentication_not_configured"),
+            )
+            .await;
+        return Err(AppError::Unauthorized(
+            "terminal requires authenticated access".to_string(),
+        ));
+    }
 
     Ok(ws.on_upgrade(move |socket| async move {
         info!(sandbox_id = %sandbox_id, "terminal websocket upgraded");
@@ -350,6 +368,15 @@ mod tests {
         spawn_server(app).await
     }
 
+    async fn spawn_fake_auth() -> String {
+        async fn auth_handler() -> impl IntoResponse {
+            StatusCode::OK
+        }
+
+        let app = Router::new().route("/", post(auth_handler));
+        spawn_server(app).await
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         old: Option<String>,
@@ -376,12 +403,21 @@ mod tests {
     async fn connect_terminal(
         ws_url: &str,
         origin: &str,
+        auth_token: &str,
+        operator_id: &str,
     ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
     {
         let mut request = ws_url.to_string().into_client_request().unwrap();
         request
             .headers_mut()
             .insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", auth_token)).unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("x-operator-id", HeaderValue::from_str(operator_id).unwrap());
         let (ws_stream, _) = timeout(Duration::from_secs(5), connect_async(request))
             .await
             .expect("websocket connect timed out")
@@ -430,14 +466,18 @@ mod tests {
             .lock()
             .await;
         let capture = ProxyCapture::default();
+        let auth_url = spawn_fake_auth().await;
         let cubemaster_url = spawn_fake_cubemaster().await;
         let proxy_url = spawn_fake_proxy(capture.clone()).await;
         let _env_guard = EnvVarGuard::set("AGENTHUB_SANDBOX_PROXY_URL", &proxy_url);
 
-        let mut config = ServerConfig::default();
-        config.cubemaster_url = cubemaster_url;
-        config.instance_type = "cubebox".to_string();
-        config.sandbox_domain = "cube.app".to_string();
+        let config = ServerConfig {
+            auth_callback_url: Some(auth_url),
+            cubemaster_url,
+            instance_type: "cubebox".to_string(),
+            sandbox_domain: "cube.app".to_string(),
+            ..ServerConfig::default()
+        };
         let state = AppState::new(config, arc(NoopLogger)).await;
         let app = build_router(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -448,7 +488,7 @@ mod tests {
 
         let ws_url = format!("ws://{}/sandboxes/sb-123/terminal?container=worker-1", addr);
         let origin = format!("http://{}", addr);
-        let mut ws = connect_terminal(&ws_url, &origin).await;
+        let mut ws = connect_terminal(&ws_url, &origin, "test-token", "tester-1").await;
 
         wait_for_len(&capture.start_payloads, 1).await;
         let start_payload = capture.start_payloads.lock().await[0].clone();

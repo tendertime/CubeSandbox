@@ -35,6 +35,10 @@
     "loadingSandbox": "Loading sandbox details",
     "selectContainer": "Select a container to open the terminal",
     "preparingContainer": "Preparing terminal session",
+    "checkingAuth": "Checking terminal authentication",
+    "configUnavailable": "Unable to read the CubeAPI runtime configuration",
+    "authNotConfigured": "CubeAPI has no terminal authentication callback configured",
+    "apiKeyMissing": "Sign in or configure an API credential before opening a terminal",
     "noContainers": "No containers were reported for this sandbox",
     "primaryContainer": "Primary",
     "containerLabel": "Container: {{container}}",
@@ -51,15 +55,7 @@
     "copy": "Copy selection",
     "fullscreen": "Fullscreen",
     "minimize": "Minimize",
-    "close": "Close terminal",
-    "resizeNorth": "Resize top edge",
-    "resizeSouth": "Resize bottom edge",
-    "resizeWest": "Resize left edge",
-    "resizeEast": "Resize right edge",
-    "resizeNorthWest": "Resize top-left corner",
-    "resizeNorthEast": "Resize top-right corner",
-    "resizeSouthWest": "Resize bottom-left corner",
-    "resizeSouthEast": "Resize bottom-right corner"
+    "close": "Close terminal"
   },
   "errors": {
     "unknown": "Unknown error",

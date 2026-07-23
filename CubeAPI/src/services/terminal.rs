@@ -4,11 +4,12 @@
 use axum::extract::ws::{self, Message};
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use reqwest::{Client, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     sync::atomic::{AtomicU32, Ordering},
     sync::Arc,
     time::{Duration, Instant},
@@ -39,7 +40,6 @@ pub struct TerminalService {
     http_client: Client,
     sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
 }
-
 #[derive(Clone)]
 struct TerminalSession {
     sandbox_id: String,
@@ -53,6 +53,40 @@ struct ResolvedTerminalTarget {
     container_id: Option<String>,
     container_name: Option<String>,
     end_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone)]
+struct TerminalSessionContext {
+    sandbox_id: String,
+    session_id: String,
+    operator_id: String,
+    container_id: Option<String>,
+}
+
+impl TerminalSessionContext {
+    async fn audit(&self, logger: &ArcLogger, level: LogLevel, action: &str, reason: Option<&str>) {
+        let mut event = LogEvent::new(level, "terminal.session")
+            .field("action", action)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("operator_id", &self.operator_id)
+            .field("session_id", &self.session_id);
+        if let Some(container_id) = self.container_id.as_deref() {
+            event = event.field("container_id", container_id);
+        }
+        if let Some(reason) = reason {
+            event = event.field("reason", reason);
+        }
+        logger.log(event).await;
+    }
+}
+
+#[derive(Clone)]
+struct TerminalSessionRuntime {
+    sandbox_service: SandboxService,
+    sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
+    logger: ArcLogger,
+    context: TerminalSessionContext,
+    hold_enabled: bool,
 }
 
 impl TerminalService {
@@ -81,13 +115,7 @@ impl TerminalService {
             .unwrap_or(8)
     }
 
-    async fn register_session(
-        &self,
-        session_id: String,
-        sandbox_id: String,
-        container_id: Option<String>,
-        operator_id: String,
-    ) -> Result<(), AppError> {
+    async fn register_session(&self, context: &TerminalSessionContext) -> Result<(), AppError> {
         let mut sessions = self.sessions.lock().await;
         let max_total = Self::max_total_sessions();
         if sessions.len() >= max_total {
@@ -99,22 +127,22 @@ impl TerminalService {
 
         let per_sandbox = sessions
             .values()
-            .filter(|session| session.sandbox_id == sandbox_id)
+            .filter(|session| session.sandbox_id == context.sandbox_id)
             .count();
         let max_per_sandbox = Self::max_sessions_per_sandbox();
         if per_sandbox >= max_per_sandbox {
             return Err(AppError::TooManyRequests(format!(
                 "terminal session limit reached for sandbox {}: {}",
-                sandbox_id, max_per_sandbox
+                context.sandbox_id, max_per_sandbox
             )));
         }
 
         sessions.insert(
-            session_id.clone(),
+            context.session_id.clone(),
             TerminalSession {
-                sandbox_id,
-                container_id,
-                operator_id,
+                sandbox_id: context.sandbox_id.clone(),
+                container_id: context.container_id.clone(),
+                operator_id: context.operator_id.clone(),
                 started_at: chrono::Utc::now(),
             },
         );
@@ -126,32 +154,6 @@ impl TerminalService {
         session_id: &str,
     ) -> Option<TerminalSession> {
         sessions.lock().await.remove(session_id)
-    }
-
-    async fn audit(
-        logger: &ArcLogger,
-        level: LogLevel,
-        action: &str,
-        sandbox_id: &str,
-        session_id: Option<&str>,
-        operator_id: &str,
-        container_id: Option<&str>,
-        reason: Option<&str>,
-    ) {
-        let mut event = LogEvent::new(level, "terminal.session")
-            .field("action", action)
-            .field("sandbox_id", sandbox_id)
-            .field("operator_id", operator_id);
-        if let Some(container_id) = container_id {
-            event = event.field("container_id", container_id);
-        }
-        if let Some(session_id) = session_id {
-            event = event.field("session_id", session_id);
-        }
-        if let Some(reason) = reason {
-            event = event.field("reason", reason);
-        }
-        logger.log(event).await;
     }
 
     async fn validate_terminal_target(
@@ -198,6 +200,8 @@ impl TerminalService {
                 })?
         } else if containers.len() == 1 {
             &containers[0]
+        } else if let Some(primary) = Self::unique_primary_container(containers) {
+            primary
         } else if containers.is_empty() {
             return Err(AppError::NotFound(format!(
                 "sandbox {} does not expose any containers",
@@ -218,6 +222,16 @@ impl TerminalService {
         }
 
         Ok((selected.container_id.clone(), selected.name.clone()))
+    }
+
+    fn unique_primary_container(containers: &[SandboxContainer]) -> Option<&SandboxContainer> {
+        let mut primary = containers.iter().filter(|container| container.primary);
+        let selected = primary.next()?;
+        if primary.next().is_none() {
+            Some(selected)
+        } else {
+            None
+        }
     }
 
     async fn send_terminal_event<T: Serialize>(
@@ -250,26 +264,26 @@ impl TerminalService {
             .filter(|value| !value.is_empty())
     }
 
-    fn parse_resize_message(text: &str) -> Option<(u32, u32)> {
-        let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
-        if value.get("type")?.as_str()? != "resize" {
-            return None;
-        }
-        let rows = value.get("rows").and_then(|v| v.as_u64()).unwrap_or(24);
-        let cols = value.get("cols").and_then(|v| v.as_u64()).unwrap_or(80);
-        Some((rows.clamp(1, 512) as u32, cols.clamp(1, 512) as u32))
+    fn sandbox_id_is_safe(sandbox_id: &str) -> bool {
+        !sandbox_id.is_empty()
+            && sandbox_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
     }
 
-    fn parse_ping_message(text: &str) -> bool {
-        serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-            .is_some_and(|kind| kind == "ping")
+    fn validate_terminal_sandbox_id(sandbox_id: &str) -> Result<(), AppError> {
+        if Self::sandbox_id_is_safe(sandbox_id) {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!(
+                "invalid sandbox id: {}",
+                sandbox_id
+            )))
+        }
+    }
+
+    fn parse_client_message(text: &str) -> Option<TerminalClientMessage> {
+        serde_json::from_str::<TerminalClientMessage>(text).ok()
     }
 
     fn terminal_error_code(error: &AppError) -> &'static str {
@@ -286,8 +300,6 @@ impl TerminalService {
                     "container_not_found"
                 } else if message.contains("is not running") && message.contains("container ") {
                     "container_not_running"
-                } else if message.contains("is not running") && message.contains("sandbox ") {
-                    "sandbox_not_running"
                 } else {
                     "sandbox_not_running"
                 }
@@ -312,6 +324,75 @@ impl TerminalService {
             .await
     }
 
+    async fn restore_sandbox_hold(
+        sandbox_service: &SandboxService,
+        sandbox_id: &str,
+        original_end_at: Option<DateTime<Utc>>,
+        session_id: &str,
+    ) {
+        let Some(original_end_at) = original_end_at else {
+            return;
+        };
+        let now = Utc::now();
+        let remaining = original_end_at
+            .signed_duration_since(now)
+            .num_seconds()
+            .max(0);
+        let timeout = remaining.min(i32::MAX as i64) as i32;
+        if let Err(e) = sandbox_service.set_timeout(sandbox_id, timeout).await {
+            warn!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                error = %e,
+                original_end_at = %original_end_at,
+                "failed to restore sandbox timeout after terminal session"
+            );
+        } else {
+            info!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                original_end_at = %original_end_at,
+                timeout = timeout,
+                "sandbox timeout restored after terminal session"
+            );
+        }
+    }
+
+    async fn cleanup_terminal_session(
+        runtime: TerminalSessionRuntime,
+        original_end_at: Option<DateTime<Utc>>,
+    ) {
+        let context = &runtime.context;
+        if runtime.hold_enabled {
+            Self::restore_sandbox_hold(
+                &runtime.sandbox_service,
+                &context.sandbox_id,
+                original_end_at,
+                &context.session_id,
+            )
+            .await;
+        }
+        if let Some(session) = Self::unregister_session(runtime.sessions, &context.session_id).await
+        {
+            info!(
+                sandbox_id = %session.sandbox_id,
+                session_id = %context.session_id,
+                container_id = ?session.container_id,
+                operator_id = %session.operator_id,
+                started_at = %session.started_at,
+                "terminal session unregistered"
+            );
+        } else {
+            info!(
+                sandbox_id = %context.sandbox_id,
+                session_id = %context.session_id,
+                container_id = ?context.container_id,
+                operator_id = %context.operator_id,
+                "terminal session cleanup completed"
+            );
+        }
+    }
+
     async fn refresh_terminal_hold(
         sandbox_service: &SandboxService,
         sandbox_id: &str,
@@ -330,47 +411,35 @@ impl TerminalService {
         }
     }
 
-    fn is_control_message(text: &str) -> bool {
-        if !text.starts_with('{') {
-            return false;
-        }
-        serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-            .is_some_and(|kind| matches!(kind.as_str(), "resize" | "ping"))
-    }
-
     async fn handle_client_text(
         pty_handle: &PtyHandle,
         sandbox_id: &str,
         session_id: &str,
         text: &str,
     ) -> Result<(), String> {
-        if let Some((rows, cols)) = Self::parse_resize_message(text) {
-            info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize");
-            if let Err(e) = pty_handle.resize(rows, cols).await {
-                if e.contains("PTY process did not start in time")
-                    || e.contains("PTY process has not started yet")
-                {
-                    warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize deferred until PTY is ready");
-                } else {
-                    warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize failed; keeping session alive");
+        if let Some(message) = Self::parse_client_message(text) {
+            match message {
+                TerminalClientMessage::Resize { rows, cols } => {
+                    let rows = rows.unwrap_or(24).clamp(1, 512) as u32;
+                    let cols = cols.unwrap_or(80).clamp(1, 512) as u32;
+                    info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize");
+                    if let Err(e) = pty_handle.resize(rows, cols).await {
+                        if e.contains("PTY process did not start in time")
+                            || e.contains("PTY process has not started yet")
+                        {
+                            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize deferred until PTY is ready");
+                        } else {
+                            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize failed; keeping session alive");
+                        }
+                    } else {
+                        info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize applied");
+                    }
+                    return Ok(());
                 }
-            } else {
-                info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize applied");
+                TerminalClientMessage::Ping => {
+                    return Ok(());
+                }
             }
-            return Ok(());
-        }
-        if Self::parse_ping_message(text) {
-            return Ok(());
-        }
-        if Self::is_control_message(text) {
-            return Ok(());
         }
         info!(sandbox_id = %sandbox_id, session_id = %session_id, input_len = text.len(), "terminal input");
         match pty_handle.send_stdin(text).await {
@@ -418,23 +487,18 @@ impl TerminalService {
     async fn run_pty_session(
         mut socket: ws::WebSocket,
         mut send_rx: futures::channel::mpsc::Receiver<Message>,
+        _send_tx_keepalive: Arc<Mutex<futures::channel::mpsc::Sender<Message>>>,
         pty_handle: PtyHandle,
-        sandbox_service: SandboxService,
-        sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
-        logger: ArcLogger,
-        sandbox_id: String,
-        session_id: String,
-        operator_id: String,
-        container_id: Option<String>,
-        hold_enabled: bool,
+        runtime: TerminalSessionRuntime,
     ) {
+        let context = &runtime.context;
         let start = Instant::now();
         let mut last_activity = Instant::now();
         let mut hold_interval = tokio::time::interval(TERMINAL_KEEPALIVE_INTERVAL);
 
         let _ = socket
             .send(Self::server_event_message(&TerminalServerEvent::Ready {
-                session_id: &session_id,
+                session_id: &context.session_id,
             }))
             .await;
 
@@ -446,7 +510,7 @@ impl TerminalService {
 
             tokio::select! {
                 _ = &mut idle_sleep => {
-                    Self::audit(&logger, LogLevel::Info, "timeout", &sandbox_id, Some(&session_id), &operator_id, container_id.as_deref(), Some("idle_timeout")).await;
+                    context.audit(&runtime.logger, LogLevel::Info, "timeout", Some("idle_timeout")).await;
                     let _ = socket
                         .send(Self::server_event_message(&TerminalServerEvent::Closed {
                             reason: "idle_timeout",
@@ -456,7 +520,7 @@ impl TerminalService {
                     break;
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(start + TERMINAL_MAX_LIFETIME)) => {
-                    Self::audit(&logger, LogLevel::Info, "timeout", &sandbox_id, Some(&session_id), &operator_id, container_id.as_deref(), Some("max_lifetime")).await;
+                    context.audit(&runtime.logger, LogLevel::Info, "timeout", Some("max_lifetime")).await;
                     let _ = socket
                         .send(Self::server_event_message(&TerminalServerEvent::Closed {
                             reason: "max_lifetime",
@@ -466,8 +530,8 @@ impl TerminalService {
                     break;
                 }
                 _ = hold_interval.tick() => {
-                    if hold_enabled {
-                        Self::refresh_terminal_hold(&sandbox_service, &sandbox_id, &session_id).await;
+                    if runtime.hold_enabled {
+                        Self::refresh_terminal_hold(&runtime.sandbox_service, &context.sandbox_id, &context.session_id).await;
                     }
                     if socket.send(Message::Ping(Vec::new())).await.is_err() {
                         break;
@@ -477,9 +541,9 @@ impl TerminalService {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             last_activity = Instant::now();
-                            if let Err(e) = Self::handle_client_text(&pty_handle, &sandbox_id, &session_id, &text).await {
-                                warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal input handling error");
-                                Self::audit(&logger, LogLevel::Warn, "close", &sandbox_id, Some(&session_id), &operator_id, container_id.as_deref(), Some("pty_input_error")).await;
+                            if let Err(e) = Self::handle_client_text(&pty_handle, &context.sandbox_id, &context.session_id, &text).await {
+                                warn!(sandbox_id = %context.sandbox_id, session_id = %context.session_id, error = %e, "terminal input handling error");
+                                context.audit(&runtime.logger, LogLevel::Warn, "close", Some("pty_input_error")).await;
                                 let _ = socket
                                     .send(Self::server_event_message(&TerminalServerEvent::Closed {
                                         reason: "pty_input_error",
@@ -491,9 +555,9 @@ impl TerminalService {
                         }
                         Some(Ok(Message::Binary(data))) => {
                             last_activity = Instant::now();
-                            if let Err(e) = Self::handle_client_binary(&pty_handle, &sandbox_id, &session_id, &data).await {
-                                warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal binary input handling error");
-                                Self::audit(&logger, LogLevel::Warn, "close", &sandbox_id, Some(&session_id), &operator_id, container_id.as_deref(), Some("pty_input_error")).await;
+                            if let Err(e) = Self::handle_client_binary(&pty_handle, &context.sandbox_id, &context.session_id, &data).await {
+                                warn!(sandbox_id = %context.sandbox_id, session_id = %context.session_id, error = %e, "terminal binary input handling error");
+                                context.audit(&runtime.logger, LogLevel::Warn, "close", Some("pty_input_error")).await;
                                 let _ = socket
                                     .send(Self::server_event_message(&TerminalServerEvent::Closed {
                                         reason: "pty_input_error",
@@ -509,7 +573,7 @@ impl TerminalService {
                         Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) => break,
                 Some(Err(e)) => {
-                    warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal websocket input error");
+                    warn!(sandbox_id = %context.sandbox_id, session_id = %context.session_id, error = %e, "terminal websocket input error");
                     break;
                 }
                         None => break,
@@ -520,36 +584,16 @@ impl TerminalService {
                         if socket.send(msg).await.is_err() {
                             break;
                         }
-                    } else {
-                        break;
                     }
                 }
             }
         }
         let _ = pty_handle.kill().await;
         let _ = socket.send(Message::Close(None)).await;
-        if let Some(session) = Self::unregister_session(sessions, &session_id).await {
-            info!(
-                sandbox_id = %session.sandbox_id,
-                session_id = %session_id,
-                container_id = ?session.container_id,
-                operator_id = %session.operator_id,
-                started_at = %session.started_at,
-                "terminal session unregistered"
-            );
-        }
-        Self::audit(
-            &logger,
-            LogLevel::Info,
-            "close",
-            &sandbox_id,
-            Some(&session_id),
-            &operator_id,
-            container_id.as_deref(),
-            None,
-        )
-        .await;
-        info!(sandbox_id = %sandbox_id, session_id = %session_id, "terminal connection closed");
+        context
+            .audit(&runtime.logger, LogLevel::Info, "close", None)
+            .await;
+        info!(sandbox_id = %context.sandbox_id, session_id = %context.session_id, "terminal connection closed");
     }
 
     pub async fn handle_terminal(
@@ -561,6 +605,13 @@ impl TerminalService {
         operator_id: String,
     ) -> Result<(), AppError> {
         info!(sandbox_id = %sandbox_id, "terminal connection started");
+        Self::validate_terminal_sandbox_id(&sandbox_id)?;
+        let mut context = TerminalSessionContext {
+            sandbox_id: sandbox_id.clone(),
+            session_id: Uuid::new_v4().to_string(),
+            operator_id,
+            container_id: None,
+        };
 
         let resolved = match self
             .validate_terminal_target(&sandbox_id, container_selector.as_deref())
@@ -571,51 +622,33 @@ impl TerminalService {
                 let message = e.to_string();
                 let code = Self::terminal_error_code(&e);
                 warn!(sandbox_id = %sandbox_id, error = %message, "terminal target validation failed");
-                Self::audit(
-                    &logger,
-                    LogLevel::Warn,
-                    "target_validation_failed",
-                    &sandbox_id,
-                    None,
-                    &operator_id,
-                    None,
-                    Some(code),
-                )
-                .await;
-                Self::close_with_error(&mut socket, code, message).await;
+                context
+                    .audit(
+                        &logger,
+                        LogLevel::Warn,
+                        "target_validation_failed",
+                        Some(code),
+                    )
+                    .await;
+                Self::close_with_error(&mut socket, code, code.to_string()).await;
                 return Ok(());
             }
         };
         let access_token = resolved.access_token.unwrap_or_default();
         let selected_container_id = resolved.container_id.clone();
         let selected_container_name = resolved.container_name.clone();
+        context.container_id = selected_container_id.clone();
         let hold_enabled = resolved.end_at.is_some();
+        let original_end_at = resolved.end_at;
 
-        let session_id = Uuid::new_v4().to_string();
-        if let Err(e) = self
-            .register_session(
-                session_id.clone(),
-                sandbox_id.clone(),
-                selected_container_id.clone(),
-                operator_id.clone(),
-            )
-            .await
-        {
+        if let Err(e) = self.register_session(&context).await {
             let message = e.to_string();
             let code = Self::terminal_error_code(&e);
-            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %message, "terminal session registration failed");
-            Self::audit(
-                &logger,
-                LogLevel::Warn,
-                "session_rejected",
-                &sandbox_id,
-                Some(&session_id),
-                &operator_id,
-                selected_container_id.as_deref(),
-                Some(code),
-            )
-            .await;
-            Self::close_with_error(&mut socket, code, message).await;
+            warn!(sandbox_id = %sandbox_id, session_id = %context.session_id, error = %message, "terminal session registration failed");
+            context
+                .audit(&logger, LogLevel::Warn, "session_rejected", Some(code))
+                .await;
+            Self::close_with_error(&mut socket, code, code.to_string()).await;
             return Ok(());
         }
 
@@ -625,26 +658,28 @@ impl TerminalService {
         {
             let message = e.to_string();
             warn!(sandbox_id = %sandbox_id, error = %message, "failed to hold sandbox for terminal");
-            let _ = Self::unregister_session(self.sessions.clone(), &session_id).await;
-            Self::audit(
-                &logger,
-                LogLevel::Warn,
-                "hold_failed",
-                &sandbox_id,
-                Some(&session_id),
-                &operator_id,
-                selected_container_id.as_deref(),
-                Some("sandbox_hold_failed"),
+            let _ = Self::unregister_session(self.sessions.clone(), &context.session_id).await;
+            context
+                .audit(
+                    &logger,
+                    LogLevel::Warn,
+                    "hold_failed",
+                    Some("sandbox_hold_failed"),
+                )
+                .await;
+            Self::close_with_error(
+                &mut socket,
+                "sandbox_hold_failed",
+                "sandbox_hold_failed".to_string(),
             )
             .await;
-            Self::close_with_error(&mut socket, "sandbox_hold_failed", message).await;
             return Ok(());
         }
 
         if hold_enabled {
             info!(
                 sandbox_id = %sandbox_id,
-                session_id = %session_id,
+                session_id = %context.session_id,
                 container_id = ?selected_container_id,
                 container_name = ?selected_container_name,
                 "sandbox terminal hold established"
@@ -652,23 +687,13 @@ impl TerminalService {
         } else {
             info!(
                 sandbox_id = %sandbox_id,
-                session_id = %session_id,
+                session_id = %context.session_id,
                 container_id = ?selected_container_id,
                 container_name = ?selected_container_name,
                 "sandbox has no deadline; terminal hold skipped"
             );
         }
-        Self::audit(
-            &logger,
-            LogLevel::Info,
-            "open",
-            &sandbox_id,
-            Some(&session_id),
-            &operator_id,
-            selected_container_id.as_deref(),
-            None,
-        )
-        .await;
+        context.audit(&logger, LogLevel::Info, "open", None).await;
 
         let proxy_base = std::env::var("AGENTHUB_SANDBOX_PROXY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1".to_string());
@@ -680,67 +705,66 @@ impl TerminalService {
         );
         info!(sandbox_id = %sandbox_id, url = %url, "connecting to envd PTY via proxy");
 
-        let sandbox_id_clone = sandbox_id.clone();
         let http_client = self.http_client.clone();
-        let access_token = access_token.clone();
         let envd_auth = Self::terminal_auth_header();
-        let sandbox_service = self.sandbox_service.clone();
-        let sessions = self.sessions.clone();
+        let runtime = TerminalSessionRuntime {
+            sandbox_service: self.sandbox_service.clone(),
+            sessions: self.sessions.clone(),
+            logger,
+            context,
+            hold_enabled,
+        };
 
         let (send_tx, send_rx) = futures::channel::mpsc::channel(100);
         let send_tx = Arc::new(Mutex::new(send_tx));
 
         tokio::spawn(async move {
-            match Self::connect_envd_pty(
-                &http_client,
-                &url,
-                &access_token,
-                envd_auth.as_deref(),
-                selected_container_id.as_deref(),
-                send_tx.clone(),
-                sandbox_id_clone.clone(),
-            )
-            .await
-            {
-                Ok(pty_handle) => {
-                    Self::run_pty_session(
-                        socket,
-                        send_rx,
-                        pty_handle,
-                        sandbox_service,
-                        sessions.clone(),
-                        logger.clone(),
-                        sandbox_id_clone.clone(),
-                        session_id,
-                        operator_id,
-                        selected_container_id.clone(),
-                        hold_enabled,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!(sandbox_id = %sandbox_id_clone, error = %e, "envd PTY connection failed");
-                    let _ = Self::unregister_session(sessions.clone(), &session_id).await;
-                    Self::audit(
-                        &logger,
-                        LogLevel::Warn,
-                        "pty_connect_failed",
-                        &sandbox_id_clone,
-                        Some(&session_id),
-                        &operator_id,
-                        selected_container_id.as_deref(),
-                        Some("pty_connect_failed"),
-                    )
-                    .await;
-                    let _ = socket
-                        .send(Self::server_event_message(&TerminalServerEvent::Error {
-                            code: "pty_connect_failed",
-                            message: &e,
-                        }))
+            let run_runtime = runtime.clone();
+            let run = async move {
+                match Self::connect_envd_pty(
+                    &http_client,
+                    &url,
+                    &access_token,
+                    envd_auth.as_deref(),
+                    run_runtime.context.container_id.as_deref(),
+                    send_tx.clone(),
+                    run_runtime.context.sandbox_id.clone(),
+                )
+                .await
+                {
+                    Ok(pty_handle) => {
+                        Self::run_pty_session(
+                            socket,
+                            send_rx,
+                            send_tx.clone(),
+                            pty_handle,
+                            run_runtime.clone(),
+                        )
                         .await;
-                    let _ = socket.send(Message::Close(None)).await;
+                    }
+                    Err(e) => {
+                        warn!(sandbox_id = %run_runtime.context.sandbox_id, error = %e, "envd PTY connection failed");
+                        run_runtime
+                            .context
+                            .audit(
+                                &run_runtime.logger,
+                                LogLevel::Warn,
+                                "pty_connect_failed",
+                                Some("pty_connect_failed"),
+                            )
+                            .await;
+                        let _ = socket
+                            .send(Self::server_event_message(&TerminalServerEvent::Error {
+                                code: "pty_connect_failed",
+                                message: "pty_connect_failed",
+                            }))
+                            .await;
+                        let _ = socket.send(Message::Close(None)).await;
+                    }
                 }
-            }
+            };
+            let _ = AssertUnwindSafe(run).catch_unwind().await;
+            Self::cleanup_terminal_session(runtime, original_end_at).await;
         });
 
         Ok(())
@@ -793,6 +817,7 @@ impl TerminalService {
         let resp = http_client
             .post(url)
             .headers(headers)
+            .timeout(Duration::from_secs(30))
             .body(body)
             .send()
             .await
@@ -828,25 +853,30 @@ impl TerminalService {
             match resp.chunk().await {
                 Ok(Some(data)) => {
                     buffer.extend(data);
+                    let mut consumed = 0usize;
                     loop {
-                        if buffer.len() < 5 {
+                        if buffer.len() < consumed + 5 {
                             break;
                         }
-                        let flags = buffer[0];
-                        let size = u32::from_be_bytes(buffer[1..5].try_into().unwrap()) as usize;
-                        if buffer.len() < 5 + size {
+                        let frame_start = consumed;
+                        let flags = buffer[frame_start];
+                        let size = u32::from_be_bytes(
+                            buffer[frame_start + 1..frame_start + 5].try_into().unwrap(),
+                        ) as usize;
+                        let frame_end = frame_start + 5 + size;
+                        if buffer.len() < frame_end {
                             break;
                         }
-                        let raw = buffer[5..5 + size].to_vec();
-                        buffer = buffer[5 + size..].to_vec();
+                        let raw = &buffer[frame_start + 5..frame_end];
 
                         if (flags & 0x01) != 0 {
                             warn!(sandbox_id = %sandbox_id, "compressed Connect stream messages are not supported");
+                            consumed = frame_end;
                             continue;
                         }
 
                         if (flags & 0x02) != 0 {
-                            if let Ok(end) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                            if let Ok(end) = serde_json::from_slice::<serde_json::Value>(raw) {
                                 if let Some(error) = end.get("error") {
                                     warn!(sandbox_id = %sandbox_id, error = %error, "Connect stream ended with error");
                                 } else {
@@ -858,7 +888,7 @@ impl TerminalService {
                             return;
                         }
 
-                        if let Ok(message) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                        if let Ok(message) = serde_json::from_slice::<serde_json::Value>(raw) {
                             if let Some(event) = message.get("event") {
                                 if let Some(start) = event.get("start") {
                                     if let Some(start_pid) =
@@ -876,7 +906,7 @@ impl TerminalService {
                                                     .decode(pty_data)
                                             {
                                                 if let Ok(text) = String::from_utf8(decoded) {
-                                                    let _ = sender
+                                                    if sender
                                                         .lock()
                                                         .await
                                                         .send(Self::server_event_message(
@@ -884,7 +914,11 @@ impl TerminalService {
                                                                 data: &text,
                                                             },
                                                         ))
-                                                        .await;
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
                                                 }
                                             }
                                         }
@@ -892,6 +926,10 @@ impl TerminalService {
                                 }
                             }
                         }
+                        consumed = frame_end;
+                    }
+                    if consumed > 0 {
+                        buffer.drain(..consumed);
                     }
                 }
                 Ok(None) => break,
@@ -901,6 +939,7 @@ impl TerminalService {
                 }
             }
         }
+        info!(sandbox_id = %sandbox_id, "envd stream reader finished");
     }
 
     fn encode_connect_envelope(data: &[u8]) -> Vec<u8> {
@@ -910,6 +949,18 @@ impl TerminalService {
         result.extend_from_slice(data);
         result
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum TerminalClientMessage {
+    #[serde(rename = "resize")]
+    Resize {
+        rows: Option<u64>,
+        cols: Option<u64>,
+    },
+    #[serde(rename = "ping")]
+    Ping,
 }
 
 struct PtyHandle {
@@ -1091,32 +1142,38 @@ mod tests {
 
     #[test]
     fn parses_resize_control_message() {
-        assert_eq!(
-            TerminalService::parse_resize_message(r#"{"type":"resize","rows":40,"cols":120}"#),
-            Some((40, 120))
-        );
-    }
-
-    #[test]
-    fn clamps_resize_dimensions() {
-        assert_eq!(
-            TerminalService::parse_resize_message(r#"{"type":"resize","rows":0,"cols":9999}"#),
-            Some((1, 512))
-        );
+        match TerminalService::parse_client_message(r#"{"type":"resize","rows":40,"cols":120}"#) {
+            Some(super::TerminalClientMessage::Resize { rows, cols }) => {
+                assert_eq!(rows, Some(40));
+                assert_eq!(cols, Some(120));
+            }
+            _ => panic!("expected resize message"),
+        }
     }
 
     #[test]
     fn ignores_non_resize_json_as_resize() {
-        assert_eq!(
-            TerminalService::parse_resize_message(r#"{"type":"input","data":"ls"}"#),
-            None
-        );
+        assert!(TerminalService::parse_client_message(r#"{"type":"input","data":"ls"}"#).is_none());
     }
 
     #[test]
     fn parses_ping_control_message() {
-        assert!(TerminalService::parse_ping_message(r#"{"type":"ping"}"#));
-        assert!(!TerminalService::parse_ping_message(r#"{"type":"resize"}"#));
+        assert!(matches!(
+            TerminalService::parse_client_message(r#"{"type":"ping"}"#),
+            Some(super::TerminalClientMessage::Ping)
+        ));
+    }
+
+    #[test]
+    fn ignores_invalid_json_as_control_message() {
+        assert!(TerminalService::parse_client_message(r#"{"type":"input","data":"ls""#).is_none());
+    }
+
+    #[test]
+    fn validates_terminal_sandbox_id_allowlist() {
+        assert!(TerminalService::sandbox_id_is_safe("sb-123_abc"));
+        assert!(!TerminalService::sandbox_id_is_safe("../sb-123"));
+        assert!(!TerminalService::sandbox_id_is_safe("sb/123"));
     }
 
     #[test]
@@ -1145,7 +1202,7 @@ mod tests {
                 status: "running".to_string(),
                 image: "img".to_string(),
                 kind: Some("sandbox".to_string()),
-                primary: true,
+                primary: false,
             },
             SandboxContainer {
                 name: "workload".to_string(),
@@ -1160,6 +1217,33 @@ mod tests {
         let err = TerminalService::resolve_terminal_container(&containers, None, "sb-1")
             .expect_err("multiple containers should require a selector");
         assert!(err.to_string().contains("multiple containers"));
+    }
+
+    #[test]
+    fn resolve_terminal_container_prefers_unique_primary_container() {
+        let containers = vec![
+            SandboxContainer {
+                name: "sandbox".to_string(),
+                container_id: "sb-1".to_string(),
+                status: "running".to_string(),
+                image: "img".to_string(),
+                kind: Some("sandbox".to_string()),
+                primary: true,
+            },
+            SandboxContainer {
+                name: "workload".to_string(),
+                container_id: "work-1".to_string(),
+                status: "running".to_string(),
+                image: "img2".to_string(),
+                kind: Some("workload".to_string()),
+                primary: false,
+            },
+        ];
+
+        let (id, name) = TerminalService::resolve_terminal_container(&containers, None, "sb-1")
+            .expect("unique primary container should resolve");
+        assert_eq!(id, "sb-1");
+        assert_eq!(name, "sandbox");
     }
 
     #[test]

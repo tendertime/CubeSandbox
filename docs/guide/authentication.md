@@ -1,10 +1,10 @@
 # Authentication
 
-By default, Cube API Server allows all requests without any authentication. To enable authentication, start the server with an auth callback URL. When configured, every incoming request is validated by forwarding the credential header to your callback service — Cube API Server acts purely as a passthrough proxy for the auth decision.
+Cube API Server supports an external callback or a built-in static API key for authentication. When either mode is configured, sandbox, template, volume, and Web Terminal requests are authenticated. Web Terminal is always protected because it grants interactive command execution; without either authentication mode, ordinary APIs remain available but terminal access is disabled.
 
 ## Enabling Authentication
 
-Pass `--auth-callback-url` at startup, or set the equivalent environment variable:
+For callback authentication, pass `--auth-callback-url` at startup or set the equivalent environment variable:
 
 ```bash
 # CLI flag
@@ -15,11 +15,18 @@ export AUTH_CALLBACK_URL=https://your-auth-service/verify
 ./cube-api
 ```
 
-When `AUTH_CALLBACK_URL` is not set (the default), all requests are allowed without any credential check.
+For a local static key instead, leave `AUTH_CALLBACK_URL` unset and configure:
+
+```bash
+export CUBE_API_KEY=your-actual-api-key
+./cube-api
+```
+
+Callback authentication takes priority when both values are set. When neither is set, ordinary APIs keep their existing behavior but Web Terminal access is disabled. CubeAPI does not fall back to anonymous terminal access.
 
 ## How It Works
 
-When a request arrives, Cube API Server:
+When a protected request arrives in callback mode, Cube API Server:
 
 1. Extracts the credential from the request header (`Authorization: Bearer` takes priority over `X-API-Key`).
 2. Forwards a `POST` request to the callback URL with the credential header, the original request path, **and the HTTP method**.
@@ -53,6 +60,8 @@ X-API-Key: your-actual-api-key
 ```
 
 Both formats are accepted. `Authorization: Bearer` takes priority if both are present.
+
+Browser WebSocket APIs cannot add these headers to an upgrade request. The WebUI therefore base64url-encodes its existing login token or API key into a terminal-only query parameter. CubeAPI decodes it and applies the same Bearer or API-key authentication before upgrading the connection.
 
 ## Callback Request Format
 
@@ -112,12 +121,41 @@ async def verify(request: Request):
         return {}                           # 200 → allow all
 
     if key in READONLY_KEYS:
+        # A terminal upgrade is GET but grants command execution, so it is never read-only.
+        if path.rstrip("/").endswith("/terminal"):
+            return Response(status_code=403)
         if method in READ_METHODS:
             return {}                       # 200 → allow reads
         return Response(status_code=403)   # deny writes/deletes
 
     return Response(status_code=401)
 ```
+
+## Local Mock
+
+For local development, you can run a built-in mock callback instead of writing your own
+service:
+
+```bash
+export MOCK_AUTH_KEYS="secret-key-1,secret-key-2"
+export MOCK_READONLY_KEYS="readonly-key-1"
+python3 scripts/mock-auth-service.py --host 127.0.0.1 --port 8081
+```
+
+Then point CubeAPI at:
+
+```bash
+export AUTH_CALLBACK_URL="http://127.0.0.1:8081/verify"
+```
+
+For local WebUI development, start the mock callback and CubeAPI together:
+
+```bash
+make cubeapi-dev-auth
+```
+
+When `MOCK_AUTH_KEYS` is unset, the mock accepts any non-empty WebUI login token or
+API key. The WebUI reuses its current login token when opening a terminal.
 
 ## Error Responses
 

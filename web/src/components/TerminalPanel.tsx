@@ -80,6 +80,24 @@ function clampPanelRect(rect: PanelRect): PanelRect {
   return { width, height, left, top };
 }
 
+function base64UrlEncode(value: string) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function resolveDefaultContainerId(containers: TerminalContainer[]) {
+  if (containers.length === 1) {
+    return containers[0].containerID;
+  }
+
+  const primaryContainers = containers.filter((container) => container.primary);
+  return primaryContainers.length === 1 ? primaryContainers[0].containerID : null;
+}
+
 export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
   const { t } = useTranslation('sandboxes');
   const sandboxQuery = useQuery({
@@ -96,6 +114,7 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
   const isResizingPanelRef = useRef(false);
   const lastSentSizeRef = useRef<{ rows: number; cols: number } | null>(null);
   const lastWindowedRectRef = useRef<PanelRect | null>(null);
+  const selectedSandboxIdRef = useRef(sandboxId);
   const [isConnected, setIsConnected] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(true);
   const [panelRect, setPanelRect] = useState<PanelRect>(() => createInitialPanelRect());
@@ -105,17 +124,29 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
   const [statusText, setStatusText] = useState(t('terminal.connecting'));
   const [fontSize, setFontSize] = useState(14);
   const [selectedContainerId, setSelectedContainerId] = useState<string | null>(null);
+  const accessToken = localStorage.getItem('cube.accessToken')?.trim() ?? '';
+  const apiKey = localStorage.getItem('cube.apiKey')?.trim() ?? '';
+  const credential = accessToken || apiKey;
+  const credentialParam = accessToken ? 'accessTokenB64' : 'apiKeyB64';
+  const canConnect = credential.length > 0;
   const detail = sandboxQuery.data as SandboxDetailWithContainers | undefined;
   const containers = detail?.containers ?? [];
   const selectedContainer = containers.find((item) => item.containerID === selectedContainerId) ?? null;
+  const defaultContainerId = resolveDefaultContainerId(containers);
 
   useEffect(() => {
-    if (containers.length === 1 && !selectedContainerId) {
-      setSelectedContainerId(containers[0].containerID);
+    const sandboxChanged = selectedSandboxIdRef.current !== sandboxId;
+    selectedSandboxIdRef.current = sandboxId;
+    setSelectedContainerId((current) =>
+      sandboxChanged ? defaultContainerId : current ?? defaultContainerId,
+    );
+  }, [defaultContainerId, sandboxId]);
+
+  useEffect(() => {
+    if (!credential) {
+      setStatusText(t('terminal.apiKeyMissing'));
+      return;
     }
-  }, [containers, selectedContainerId]);
-
-  useEffect(() => {
     if (sandboxQuery.isLoading) {
       setStatusText(t('terminal.loadingSandbox'));
       return;
@@ -127,7 +158,13 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
     if (selectedContainerId) {
       setStatusText(t('terminal.connecting'));
     }
-  }, [containers.length, sandboxQuery.isLoading, selectedContainerId, t]);
+  }, [
+    credential,
+    containers.length,
+    sandboxQuery.isLoading,
+    selectedContainerId,
+    t,
+  ]);
 
   const writeStatusLine = useCallback((message: string, color = '33') => {
     termRef.current?.write(`\r\n\x1b[1;${color}m${message}\x1b[0m\r\n`);
@@ -156,7 +193,7 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
   }, []);
 
   useEffect(() => {
-    if (!terminalRef.current || !selectedContainerId) return;
+    if (!terminalRef.current || !selectedContainerId || !canConnect) return;
     const terminalElement = terminalRef.current;
     setCanReconnect(false);
     setStatusText(t('terminal.connecting'));
@@ -223,7 +260,8 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
     fitAddon.fit();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/sandboxes/${sandboxId}/terminal?container=${encodeURIComponent(selectedContainerId)}`;
+    const authQuery = `&${credentialParam}=${encodeURIComponent(base64UrlEncode(credential))}`;
+    const wsUrl = `${protocol}//${window.location.host}/sandboxes/${sandboxId}/terminal?container=${encodeURIComponent(selectedContainerId)}${authQuery}`;
     const ws = new WebSocket(wsUrl);
     let disposed = false;
     let opened = false;
@@ -397,7 +435,18 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
       terminalElement.removeEventListener('mousedown', handleMouseDown);
       window.clearInterval(pingTimer);
     };
-  }, [sandboxId, handleCopy, handlePaste, connectionKey, selectedContainerId, t, writeStatusLine]);
+  }, [
+    credential,
+    credentialParam,
+    canConnect,
+    sandboxId,
+    handleCopy,
+    handlePaste,
+    connectionKey,
+    selectedContainerId,
+    t,
+    writeStatusLine,
+  ]);
 
   useEffect(() => {
     if (isFullscreen) return;
@@ -459,7 +508,7 @@ export function TerminalPanel({ sandboxId, onClose }: TerminalPanelProps) {
     setFontSize(Math.min(24, Math.max(10, next)));
   };
 
-  const showContainerPicker = !selectedContainerId;
+  const showContainerPicker = !selectedContainerId && !defaultContainerId && containers.length > 0;
   const containerLabel = selectedContainer
     ? `${selectedContainer.name || selectedContainer.containerID}`
     : selectedContainerId || '';

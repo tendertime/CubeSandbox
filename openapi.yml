@@ -1262,6 +1262,7 @@ components:
           - 'null'
     SandboxContainer:
       type: object
+      description: Container summary returned with sandbox details and terminal selection.
       required:
       - name
       - containerID
@@ -1271,18 +1272,24 @@ components:
       properties:
         containerID:
           type: string
+          description: Container identifier used for selection and audit logging.
         image:
           type: string
+          description: Container image name.
         kind:
           type:
           - string
           - 'null'
+          description: Optional container kind when the runtime exposes it.
         name:
           type: string
+          description: Human-readable container name.
         primary:
           type: boolean
+          description: True when this is the sandbox's primary container.
         status:
           type: string
+          description: Runtime-reported container status.
     SandboxDetail:
       type: object
       description: Detailed sandbox info returned by GET /sandboxes/{sandboxID}.

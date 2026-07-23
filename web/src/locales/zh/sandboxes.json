@@ -35,6 +35,10 @@
     "loadingSandbox": "正在加载沙箱详情",
     "selectContainer": "请选择一个容器打开终端",
     "preparingContainer": "正在准备终端会话",
+    "checkingAuth": "正在检查终端鉴权配置",
+    "configUnavailable": "无法读取 CubeAPI 运行配置",
+    "authNotConfigured": "CubeAPI 未配置终端鉴权回调",
+    "apiKeyMissing": "请先登录或配置 API 凭据后再打开终端",
     "noContainers": "该沙箱未返回容器信息",
     "primaryContainer": "主容器",
     "containerLabel": "容器: {{container}}",
@@ -51,15 +55,7 @@
     "copy": "复制选中内容",
     "fullscreen": "全屏",
     "minimize": "最小化",
-    "close": "关闭终端",
-    "resizeNorth": "拖动上边框",
-    "resizeSouth": "拖动下边框",
-    "resizeWest": "拖动左边框",
-    "resizeEast": "拖动右边框",
-    "resizeNorthWest": "拖动左上角",
-    "resizeNorthEast": "拖动右上角",
-    "resizeSouthWest": "拖动左下角",
-    "resizeSouthEast": "拖动右下角"
+    "close": "关闭终端"
   },
   "errors": {
     "unknown": "未知错误",

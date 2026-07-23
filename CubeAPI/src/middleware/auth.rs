@@ -8,6 +8,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use base64::Engine;
 
 /// Verified request identity injected by the auth middleware.
 #[derive(Debug, Clone)]
@@ -46,6 +47,32 @@ fn extract_credential(request: &Request) -> Option<AuthCredential> {
             let key = key_str.trim().to_string();
             if !key.is_empty() {
                 return Some(AuthCredential::ApiKey(key));
+            }
+        }
+    }
+
+    if request.uri().path().ends_with("/terminal") {
+        if let Some(query) = request.uri().query() {
+            for pair in query.split('&') {
+                let Some((key, value)) = pair.split_once('=') else {
+                    continue;
+                };
+                if matches!(key, "accessTokenB64" | "apiKeyB64") && !value.is_empty() {
+                    if let Ok(decoded) =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value)
+                    {
+                        if let Ok(credential) = String::from_utf8(decoded) {
+                            let credential = credential.trim().to_string();
+                            if !credential.is_empty() {
+                                return Some(if key == "accessTokenB64" {
+                                    AuthCredential::Bearer(credential)
+                                } else {
+                                    AuthCredential::ApiKey(credential)
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -91,7 +118,8 @@ fn extract_request_identity(request: &Request) -> RequestIdentity {
 ///    - Compare the extracted credential string against `cube_api_key`.
 ///    - Match → allow; mismatch or missing → 401 Unauthorized.
 ///
-/// 3. **No auth** (both unset): all requests are allowed through.
+/// 3. **No auth** (both unset): ordinary requests are allowed through, while
+///    terminal requests are rejected because they grant interactive command execution.
 ///
 /// The two credential headers are mutually exclusive; the callback receives whichever
 /// one the client sent. No extra type discriminator is needed.
@@ -111,8 +139,8 @@ pub async fn unified_auth(
 
     // Mode 1: callback auth — if a callback URL is configured, forward the
     // credential and let the external system decide.
-    let callback_url = match state.config.auth_callback_url.as_deref() {
-        Some(url) if !url.is_empty() => url.to_string(),
+    let callback_url = match state.config.auth_callback() {
+        Some(url) => url.to_string(),
         _ => String::new(),
     };
 
@@ -142,6 +170,10 @@ pub async fn unified_auth(
                     ));
                 }
             }
+        } else if request.uri().path().ends_with("/terminal") {
+            return Err(AppError::Unauthorized(
+                "Terminal authentication is not configured".to_string(),
+            ));
         }
         // Mode 3: no auth (both unset) or simple-key match — pass through.
         request.extensions_mut().insert(identity);
@@ -156,6 +188,11 @@ pub async fn unified_auth(
 
     // Require a credential when a callback is configured.
     let credential = extract_credential(&request).ok_or_else(|| {
+        tracing::warn!(
+            path = %request_path,
+            method = %request_method,
+            "authentication rejected: request credential is missing"
+        );
         AppError::Unauthorized(
             "Missing authentication: provide 'Authorization: Bearer <token>' or 'X-API-Key: <key>'"
                 .to_string(),
@@ -263,12 +300,15 @@ mod tests {
     }
 
     async fn build_test_server_with_callback(callback_url: &str) -> TestServer {
-        let mut config = ServerConfig::default();
-        config.auth_callback_url = Some(callback_url.to_string());
+        let config = ServerConfig {
+            auth_callback_url: Some(callback_url.to_string()),
+            ..ServerConfig::default()
+        };
         let state = AppState::new(config, arc(NoopLogger)).await;
         let router = Router::new()
             .route("/templates/:id", any(|| async { "ok" }))
             .route("/sandboxes/:id", any(|| async { "ok" }))
+            .route("/sandboxes/:id/terminal", any(|| async { "ok" }))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 unified_auth,
@@ -342,6 +382,58 @@ mod tests {
         assert!(paths.contains(&"/templates/abc-123"));
     }
 
+    /// Browsers cannot set arbitrary headers on WebSocket upgrades, so the
+    /// terminal endpoint accepts a base64url-encoded API key in its query.
+    #[tokio::test]
+    async fn terminal_query_api_key_is_forwarded_to_callback() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let callback_url = spawn_callback_server(StatusCode::OK, captured.clone()).await;
+        let server = build_test_server_with_callback(&callback_url).await;
+
+        server
+            .get("/sandboxes/demo/terminal")
+            .add_query_param("apiKeyB64", "dGVzdC1rZXk")
+            .await
+            .assert_status_ok();
+
+        let guard = captured.lock().await;
+        assert!(guard
+            .iter()
+            .any(|(name, value)| name == "x-api-key" && value == "test-key"));
+    }
+
+    /// A WebUI login token is transported in the query and forwarded as Bearer auth.
+    #[tokio::test]
+    async fn terminal_query_access_token_is_forwarded_as_bearer() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let callback_url = spawn_callback_server(StatusCode::OK, captured.clone()).await;
+        let server = build_test_server_with_callback(&callback_url).await;
+
+        server
+            .get("/sandboxes/demo/terminal")
+            .add_query_param("accessTokenB64", "dGVzdC10b2tlbg")
+            .await
+            .assert_status_ok();
+
+        let guard = captured.lock().await;
+        assert!(guard
+            .iter()
+            .any(|(name, value)| name == "authorization" && value == "Bearer test-token"));
+    }
+
+    #[tokio::test]
+    async fn terminal_query_rejects_invalid_api_key_encoding() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let callback_url = spawn_callback_server(StatusCode::OK, captured).await;
+        let server = build_test_server_with_callback(&callback_url).await;
+
+        server
+            .get("/sandboxes/demo/terminal")
+            .add_query_param("apiKeyB64", "not base64!")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
     /// A non-200 callback response must produce 401 Unauthorized.
     #[tokio::test]
     async fn callback_rejection_returns_401() {
@@ -362,7 +454,9 @@ mod tests {
     /// When no callback is configured, requests without credentials must pass through.
     #[tokio::test]
     async fn no_callback_configured_passthrough() {
-        let config = ServerConfig::default(); // auth_callback_url = None
+        let mut config = ServerConfig::default();
+        config.auth_callback_url = None;
+        config.cube_api_key = None;
         let state = AppState::new(config, arc(NoopLogger)).await;
         let router = Router::new()
             .route("/sandboxes/:id", any(|| async { "ok" }))
@@ -374,6 +468,28 @@ mod tests {
         let server = TestServer::new(router).unwrap();
 
         server.get("/sandboxes/xyz").await.assert_status_ok();
+    }
+
+    /// Interactive terminal access must never fall back to anonymous access.
+    #[tokio::test]
+    async fn terminal_without_auth_configuration_is_rejected() {
+        let mut config = ServerConfig::default();
+        config.auth_callback_url = None;
+        config.cube_api_key = None;
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        let router = Router::new()
+            .route("/sandboxes/:id/terminal", any(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                unified_auth,
+            ))
+            .with_state(state);
+        let server = TestServer::new(router).unwrap();
+
+        server
+            .get("/sandboxes/xyz/terminal")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 
     /// When a callback is configured, a request without credentials must return 401.

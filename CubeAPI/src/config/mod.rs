@@ -44,7 +44,7 @@ pub struct ServerConfig {
 
     /// Auth callback URL for HTTP authentication.
     ///
-    /// When set, every request (except /health) must carry either:
+    /// When set, protected routes must carry either:
     ///   - `Authorization: Bearer <token>`, or
     ///   - `X-API-Key: <key>`
     ///
@@ -54,7 +54,13 @@ pub struct ServerConfig {
     ///
     /// An HTTP 200 response grants access; any other status code returns 401 to the client.
     ///
-    /// When unset (default), all requests are allowed through without authentication.
+    /// **Security note**: Multiple HTTP methods (e.g. GET/POST/DELETE/PATCH) are mounted
+    /// on the same path (e.g. `/templates/:id`). Callbacks that only whitelist by path
+    /// cannot distinguish read from write/delete operations. Always validate both
+    /// `X-Request-Path` **and** `X-Request-Method` in your callback implementation.
+    ///
+    /// When unset, `CUBE_API_KEY` is used when configured. Without either mode,
+    /// ordinary API routes remain open while terminal access stays disabled.
     ///
     /// CLI flag: --auth-callback-url  |  Env var: AUTH_CALLBACK_URL
     #[serde(default)]
@@ -119,6 +125,22 @@ impl ServerConfig {
             .try_deserialize()?;
         Ok(cfg)
     }
+
+    pub fn auth_callback(&self) -> Option<&str> {
+        self.auth_callback_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
+
+    pub fn auth_enabled(&self) -> bool {
+        self.auth_callback().is_some()
+            || self
+                .cube_api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|key| !key.is_empty())
+    }
 }
 
 impl Default for ServerConfig {
@@ -136,5 +158,27 @@ impl Default for ServerConfig {
             auth_callback_url: None,
             cube_api_key: std::env::var("CUBE_API_KEY").ok().filter(|s| !s.is_empty()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn auth_callback_ignores_blank_values_and_trims_valid_urls() {
+        let mut config = ServerConfig::default();
+        config.cube_api_key = None;
+        assert!(!config.auth_enabled());
+
+        config.auth_callback_url = Some("   ".to_string());
+        assert!(!config.auth_enabled());
+
+        config.auth_callback_url = Some("  http://127.0.0.1:8081/verify  ".to_string());
+        assert_eq!(config.auth_callback(), Some("http://127.0.0.1:8081/verify"));
+
+        config.auth_callback_url = None;
+        config.cube_api_key = Some("test-key".to_string());
+        assert!(config.auth_enabled());
     }
 }
