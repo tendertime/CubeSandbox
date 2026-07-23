@@ -178,9 +178,13 @@ fn origin_matches_host(origin: &str, host: &str) -> bool {
 
 fn parse_origin(origin: &str) -> Option<(String, String, Option<u16>)> {
     let (scheme, rest) = origin.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
     let host_part = rest.split_once('/').map(|(host, _)| host).unwrap_or(rest);
     let (host, port) = parse_host_like(host_part)?;
-    Some((scheme.to_ascii_lowercase(), host, port))
+    Some((scheme, host, port))
 }
 
 fn parse_host_like(value: &str) -> Option<(String, Option<u16>)> {
@@ -505,6 +509,11 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_web_origin_scheme() {
+        assert!(!origin_matches_host("ftp://example.com", "example.com"));
+    }
+
+    #[test]
     fn configured_origin_allowlist_takes_priority_over_host() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -567,6 +576,11 @@ mod tests {
         let ws_url = format!("ws://{}/sandboxes/sb-123/terminal?container=worker-1", addr);
         let origin = format!("http://{}", addr);
         let mut ws = connect_terminal(&ws_url, &origin, "test-token", "tester-1").await;
+        ws.send(WsMessage::Text(
+            r#"{"type":"resize","rows":41,"cols":133}"#.to_string(),
+        ))
+        .await
+        .unwrap();
 
         wait_for_len(&capture.start_payloads, 1).await;
         let start_payload = capture.start_payloads.lock().await[0].clone();
@@ -617,11 +631,6 @@ mod tests {
         assert!(!session_id.is_empty());
         assert_eq!(saw_output.as_deref(), Some("hello from pty\n"));
 
-        ws.send(WsMessage::Text(
-            r#"{"type":"resize","rows":41,"cols":133}"#.to_string(),
-        ))
-        .await
-        .unwrap();
         ws.send(WsMessage::Text("echo hello from e2e\n".to_string()))
             .await
             .unwrap();

@@ -32,6 +32,7 @@ const TERMINAL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const TERMINAL_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const TERMINAL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const TERMINAL_KEEPALIVE_TIMEOUT_SECONDS: i32 = 3600;
+const TERMINAL_KEEPALIVE_REFRESH_TIMEOUT_SECONDS: i32 = 180;
 const TERMINAL_PTY_STARTUP_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -190,7 +191,7 @@ impl TerminalService {
                 .iter()
                 .find(|container| container.container_id == selector || container.name == selector)
                 .ok_or_else(|| {
-                    AppError::NotFound(format!(
+                    AppError::Conflict(format!(
                         "container {} not found in sandbox {}",
                         selector, sandbox_id
                     ))
@@ -200,7 +201,7 @@ impl TerminalService {
         } else if let Some(primary) = Self::unique_primary_container(containers) {
             primary
         } else if containers.is_empty() {
-            return Err(AppError::NotFound(format!(
+            return Err(AppError::Conflict(format!(
                 "sandbox {} does not expose any containers",
                 sandbox_id
             )));
@@ -396,7 +397,7 @@ impl TerminalService {
         session_id: &str,
     ) {
         if let Err(e) = sandbox_service
-            .refresh(sandbox_id, TERMINAL_KEEPALIVE_INTERVAL.as_secs() as i32)
+            .refresh(sandbox_id, TERMINAL_KEEPALIVE_REFRESH_TIMEOUT_SECONDS)
             .await
         {
             warn!(
@@ -422,7 +423,7 @@ impl TerminalService {
                     info!(sandbox_id = %sandbox_id, session_id = %session_id, rows = rows, cols = cols, "terminal resize");
                     match pty_handle.resize(rows, cols).await {
                         Err(PtyError::NotStarted) => {
-                            warn!(sandbox_id = %sandbox_id, session_id = %session_id, "terminal resize deferred until PTY is ready");
+                            return Err(PtyError::NotStarted);
                         }
                         Err(e) => {
                             warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "terminal resize failed; keeping session alive");
@@ -823,9 +824,14 @@ impl TerminalService {
             envd_auth.map(ToOwned::to_owned),
             pid.clone(),
         );
-        tokio::spawn(async move {
+        let stream_task = tokio::spawn(async move {
             Self::handle_envd_stream(resp, sender, pid, &sandbox_id).await;
         });
+
+        if let Err(e) = pty_handle.wait_for_pid(TERMINAL_PTY_STARTUP_WAIT).await {
+            stream_task.abort();
+            return Err(format!("PTY failed to become ready: {}", e));
+        }
 
         Ok(pty_handle)
     }
@@ -848,9 +854,12 @@ impl TerminalService {
                         }
                         let frame_start = consumed;
                         let flags = buffer[frame_start];
-                        let size = u32::from_be_bytes(
-                            buffer[frame_start + 1..frame_start + 5].try_into().unwrap(),
-                        ) as usize;
+                        let size = u32::from_be_bytes([
+                            buffer[frame_start + 1],
+                            buffer[frame_start + 2],
+                            buffer[frame_start + 3],
+                            buffer[frame_start + 4],
+                        ]) as usize;
                         let frame_end = frame_start + 5 + size;
                         if buffer.len() < frame_end {
                             break;
@@ -1276,18 +1285,35 @@ mod tests {
 
     #[test]
     fn terminal_error_code_distinguishes_container_conflicts() {
+        let no_containers =
+            TerminalService::resolve_terminal_container(&[], None, "sb-1").unwrap_err();
+        assert_eq!(
+            TerminalService::terminal_error_code(&no_containers),
+            "sandbox_has_no_containers"
+        );
+
+        let containers = vec![SandboxContainer {
+            name: "sandbox".to_string(),
+            container_id: "sb-1".to_string(),
+            status: "running".to_string(),
+            image: "img".to_string(),
+            kind: Some("sandbox".to_string()),
+            primary: true,
+        }];
+        let missing_container =
+            TerminalService::resolve_terminal_container(&containers, Some("worker"), "sb-1")
+                .unwrap_err();
+        assert_eq!(
+            TerminalService::terminal_error_code(&missing_container),
+            "container_not_found"
+        );
+
         assert_eq!(
             TerminalService::terminal_error_code(&AppError::Conflict(
                 "sandbox sb-1 has multiple containers; specify one via container query parameter"
                     .to_string(),
             )),
             "container_selection_required"
-        );
-        assert_eq!(
-            TerminalService::terminal_error_code(&AppError::Conflict(
-                "sandbox sb-1 does not expose any containers".to_string(),
-            )),
-            "sandbox_has_no_containers"
         );
         assert_eq!(
             TerminalService::terminal_error_code(&AppError::Conflict(
@@ -1300,12 +1326,6 @@ mod tests {
                 "sandbox sb-1 is not running".to_string(),
             )),
             "sandbox_not_running"
-        );
-        assert_eq!(
-            TerminalService::terminal_error_code(&AppError::Conflict(
-                "container worker not found in sandbox sb-1".to_string(),
-            )),
-            "container_not_found"
         );
     }
 

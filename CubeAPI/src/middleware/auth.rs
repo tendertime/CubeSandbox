@@ -25,6 +25,17 @@ enum AuthCredential {
     ApiKey(String),
 }
 
+fn is_terminal_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/sandboxes/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(sandbox_id), Some("terminal"), None) if !sandbox_id.is_empty()
+    )
+}
+
 /// Extract the auth credential from request headers (Bearer takes priority over X-API-Key).
 fn extract_credential(request: &Request) -> Option<AuthCredential> {
     let headers = request.headers();
@@ -51,7 +62,7 @@ fn extract_credential(request: &Request) -> Option<AuthCredential> {
         }
     }
 
-    if request.uri().path().ends_with("/terminal") {
+    if is_terminal_path(request.uri().path()) {
         if let Some(query) = request.uri().query() {
             for pair in query.split('&') {
                 let Some((key, value)) = pair.split_once('=') else {
@@ -154,7 +165,7 @@ pub async fn unified_auth(
             .map(str::trim)
             .filter(|key| !key.is_empty());
 
-        if expected_key.is_none() && request.uri().path().ends_with("/terminal") {
+        if expected_key.is_none() && is_terminal_path(request.uri().path()) {
             return Err(AppError::Unauthorized(
                 "Terminal authentication is not configured".to_string(),
             ));
@@ -272,6 +283,14 @@ mod tests {
     use axum_test::TestServer;
     use std::sync::Arc;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn terminal_path_matches_only_sandbox_terminal_route() {
+        assert!(is_terminal_path("/sandboxes/demo/terminal"));
+        assert!(!is_terminal_path("/admin/terminal"));
+        assert!(!is_terminal_path("/sandboxes/demo/other/terminal"));
+        assert!(!is_terminal_path("/sandboxes//terminal"));
+    }
 
     /// Spawn a callback server that responds with `respond_status` and records
     /// all received request headers into `captured_headers`.
